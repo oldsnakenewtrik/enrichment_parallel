@@ -423,18 +423,23 @@ def process_enrichment_with_retry(
                         email_fields = ['primary_email', 'secondary_email', 'admin_email', 'careers_email']
                         emails = [output.get(f) for f in email_fields if output.get(f)]
                         
-                        log_message(job_id, f"{progress_prefix} ✓ SUCCESS: Found {len(emails)} email(s) in {elapsed}s")
-                        
-                        # Log each email found
-                        for field in email_fields:
-                            if output.get(field):
-                                log_message(job_id, f"{progress_prefix}   - {field}: {output.get(field)}")
+                        # Determine status based on whether emails were found
+                        if len(emails) > 0:
+                            status = 'success'
+                            log_message(job_id, f"{progress_prefix} ✓ SUCCESS: Found {len(emails)} email(s) in {elapsed}s")
+                            # Log each email found
+                            for field in email_fields:
+                                if output.get(field):
+                                    log_message(job_id, f"{progress_prefix}   - {field}: {output.get(field)}")
+                        else:
+                            status = 'no_email'
+                            log_message(job_id, f"{progress_prefix} ⚠ NO EMAIL: Search completed but no emails found in {elapsed}s")
                         
                         if output.get('website'):
                             log_message(job_id, f"{progress_prefix}   - website: {output.get('website')}")
                         
                         return {
-                            'status': 'success',
+                            'status': status,
                             'company_name': company['company_name'],
                             'city': company.get('city'),
                             'state': company.get('state'),
@@ -526,8 +531,9 @@ def run_enrichment_job(job_id: str, companies: list, processor: str, api_key: st
         total_emails = sum(r.get('emails_found', 0) for r in results)
         actual_cost = sum(r.get('cost', 0) for r in results)
         
-        # Track success/failure counts
+        # Track success/failure/no_email counts
         success_count = len([r for r in results if r.get('status') == 'success'])
+        no_email_count = len([r for r in results if r.get('status') == 'no_email'])
         fail_count = len([r for r in results if r.get('status') == 'failed'])
         
         # Process remaining companies
@@ -555,9 +561,11 @@ def run_enrichment_job(job_id: str, companies: list, processor: str, api_key: st
             total_emails += result.get('emails_found', 0)
             actual_cost += result.get('cost', 0)
             
-            # Update counts
+            # Update counts based on status
             if result.get('status') == 'success':
                 success_count += 1
+            elif result.get('status') == 'no_email':
+                no_email_count += 1
             else:
                 fail_count += 1
             
@@ -569,6 +577,7 @@ def run_enrichment_job(job_id: str, companies: list, processor: str, api_key: st
             JOBS[job_id]['emails_found'] = total_emails
             JOBS[job_id]['actual_cost'] = actual_cost
             JOBS[job_id]['success_count'] = success_count
+            JOBS[job_id]['no_email_count'] = no_email_count
             JOBS[job_id]['fail_count'] = fail_count
             
             # Update job status in database
@@ -584,7 +593,7 @@ def run_enrichment_job(job_id: str, companies: list, processor: str, api_key: st
             if company_num % SAVE_EVERY_N == 0:
                 save_incremental_results(job_id, results)
                 log_message(job_id, f"💾 AUTO-SAVED: {company_num}/{total} companies processed")
-                log_message(job_id, f"   ✓ Success: {success_count} | ✗ Failed: {fail_count} | 📧 Emails: {total_emails}")
+                log_message(job_id, f"   ✓ With Email: {success_count} | ⚠ No Email: {no_email_count} | ✗ Failed: {fail_count} | 📧 Total: {total_emails}")
                 log_message(job_id, f"   📊 Database: Results persisted to PostgreSQL")
             
             # Progress summary every 10 companies
@@ -625,7 +634,8 @@ def run_enrichment_job(job_id: str, companies: list, processor: str, api_key: st
         log_message(job_id, f"🎉 JOB COMPLETED!")
         log_message(job_id, "=" * 60)
         log_message(job_id, f"📊 Total companies: {total}")
-        log_message(job_id, f"✅ Successful: {success_count}")
+        log_message(job_id, f"✅ Found emails: {success_count}")
+        log_message(job_id, f"⚠️  No emails: {no_email_count}")
         log_message(job_id, f"❌ Failed: {fail_count}")
         log_message(job_id, f"📧 Total emails found: {total_emails}")
         log_message(job_id, f"💰 Total cost: ${actual_cost:.2f}")
@@ -1039,6 +1049,7 @@ async def upload_csv(
         'end_time': None,
         'error': None,
         'success_count': 0,
+        'no_email_count': 0,
         'fail_count': 0,
         'processor': processor
     }
