@@ -17,7 +17,7 @@ import threading
 from queue import Queue
 import time
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -742,14 +742,10 @@ async def index():
 @app.post("/upload")
 async def upload_csv(
     file: UploadFile = File(...),
-    processor: str = "base",
-    api_key: str = None,
-    background_tasks: BackgroundTasks = None
+    processor: str = Form("base"),
+    api_key: str = Form(...)
 ):
     """Upload CSV and start enrichment job"""
-    
-    if not api_key:
-        raise HTTPException(status_code=400, detail="API key required")
     
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="File must be a CSV")
@@ -904,6 +900,12 @@ async def download_csv_results(job_id: str):
 async def health_check():
     """Health check endpoint for Railway"""
     return {"status": "healthy", "jobs_count": len(JOBS)}
+
+
+@app.get("/favicon.ico")
+async def favicon():
+    """Return empty favicon to prevent 404"""
+    return JSONResponse(content={}, status_code=204)
 
 
 if __name__ == "__main__":
