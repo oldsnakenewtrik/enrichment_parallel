@@ -22,6 +22,7 @@ Complete guide for deploying the Email Enrichment Tool to Railway.
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `PORT` | ✅ Auto-set | Railway automatically injects this. **Do not set manually.** |
+| `DATABASE_URL` | ✅ Auto-set | PostgreSQL connection string. Auto-injected when you add a Postgres database. |
 
 ### Optional Variables
 
@@ -30,6 +31,74 @@ Complete guide for deploying the Email Enrichment Tool to Railway.
 | None | - | The Parallel API key is entered via the web UI for security |
 
 > **Note:** This app intentionally does NOT store API keys as environment variables. Users enter their Parallel API key through the web interface for each job, which is more secure for multi-tenant usage.
+
+---
+
+## 1.5. Adding PostgreSQL Database (Required)
+
+The app uses PostgreSQL to persist job results. **Without a database, results are lost on redeploy.**
+
+### Step 1: Add Database in Railway
+
+1. In your Railway project, click **"+ New"**
+2. Select **"Database"** → **"PostgreSQL"**
+3. Railway automatically creates and links the database
+4. The `DATABASE_URL` variable is auto-injected into your service
+
+### Step 2: Verify Connection
+
+After deployment, check the logs for:
+```
+Database tables initialized successfully
+```
+
+If you see `No DATABASE_URL configured - using in-memory storage only`, the database is not linked.
+
+### Database Schema
+
+The app automatically creates these tables:
+
+```sql
+-- Jobs table
+CREATE TABLE jobs (
+    job_id VARCHAR(36) PRIMARY KEY,
+    status VARCHAR(20),
+    total_rows INTEGER,
+    processed_rows INTEGER,
+    emails_found INTEGER,
+    estimated_cost DECIMAL(10,2),
+    actual_cost DECIMAL(10,2),
+    start_time TIMESTAMP,
+    end_time TIMESTAMP,
+    error TEXT,
+    success_count INTEGER,
+    fail_count INTEGER,
+    processor VARCHAR(20),
+    created_at TIMESTAMP
+);
+
+-- Results table (each enriched company)
+CREATE TABLE results (
+    id SERIAL PRIMARY KEY,
+    job_id VARCHAR(36),
+    company_name VARCHAR(500),
+    city VARCHAR(200),
+    state VARCHAR(50),
+    status VARCHAR(20),
+    primary_email VARCHAR(500),
+    secondary_email VARCHAR(500),
+    admin_email VARCHAR(500),
+    careers_email VARCHAR(500),
+    website VARCHAR(500),
+    email_sources TEXT,
+    confidence VARCHAR(50),
+    run_id VARCHAR(100),
+    emails_found INTEGER,
+    cost DECIMAL(10,4),
+    error TEXT,
+    created_at TIMESTAMP
+);
+```
 
 ---
 

@@ -4,6 +4,7 @@ Email Enrichment Web Application
 - Streaming logs via SSE
 - Background processing with retry logic
 - Deep email search (multiple emails per location)
+- PostgreSQL persistence for Railway
 """
 import os
 import csv
@@ -27,7 +28,114 @@ import uvicorn
 # Parallel API
 from parallel import Parallel
 
+# Database
+import psycopg2
+from psycopg2.extras import RealDictCursor, Json
+from contextlib import contextmanager
+
 app = FastAPI(title="Email Enrichment API", version="1.0.0")
+
+# Database connection
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+def get_db_connection():
+    """Get database connection, returns None if no DATABASE_URL"""
+    if not DATABASE_URL:
+        return None
+    try:
+        # Railway uses postgres:// but psycopg2 needs postgresql://
+        db_url = DATABASE_URL.replace("postgres://", "postgresql://")
+        return psycopg2.connect(db_url, cursor_factory=RealDictCursor)
+    except Exception as e:
+        print(f"Database connection error: {e}")
+        return None
+
+@contextmanager
+def db_cursor():
+    """Context manager for database cursor"""
+    conn = get_db_connection()
+    if conn is None:
+        yield None
+        return
+    try:
+        cur = conn.cursor()
+        yield cur
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
+
+def init_db():
+    """Initialize database tables"""
+    conn = get_db_connection()
+    if conn is None:
+        print("No DATABASE_URL configured - using in-memory storage only")
+        return
+    
+    try:
+        cur = conn.cursor()
+        
+        # Create jobs table
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS jobs (
+                job_id VARCHAR(36) PRIMARY KEY,
+                status VARCHAR(20) DEFAULT 'pending',
+                total_rows INTEGER DEFAULT 0,
+                processed_rows INTEGER DEFAULT 0,
+                emails_found INTEGER DEFAULT 0,
+                estimated_cost DECIMAL(10,2) DEFAULT 0,
+                actual_cost DECIMAL(10,2) DEFAULT 0,
+                start_time TIMESTAMP,
+                end_time TIMESTAMP,
+                error TEXT,
+                success_count INTEGER DEFAULT 0,
+                fail_count INTEGER DEFAULT 0,
+                processor VARCHAR(20) DEFAULT 'base',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Create results table
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS results (
+                id SERIAL PRIMARY KEY,
+                job_id VARCHAR(36) REFERENCES jobs(job_id),
+                company_name VARCHAR(500),
+                city VARCHAR(200),
+                state VARCHAR(50),
+                status VARCHAR(20),
+                primary_email VARCHAR(500),
+                secondary_email VARCHAR(500),
+                admin_email VARCHAR(500),
+                careers_email VARCHAR(500),
+                website VARCHAR(500),
+                email_sources TEXT,
+                confidence VARCHAR(50),
+                run_id VARCHAR(100),
+                emails_found INTEGER DEFAULT 0,
+                cost DECIMAL(10,4) DEFAULT 0,
+                error TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Create index for faster job lookups
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_results_job_id ON results(job_id)
+        """)
+        
+        conn.commit()
+        print("Database tables initialized successfully")
+    except Exception as e:
+        print(f"Database initialization error: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+# Initialize database on startup
+init_db()
 
 # CORS for frontend
 app.add_middleware(
@@ -119,8 +227,113 @@ def log_message(job_id: str, message: str, level: str = "INFO"):
     print(f"[{job_id[:8]}] {log_entry}")
 
 
+def save_result_to_db(job_id: str, result: dict):
+    """Save a single result to the database"""
+    with db_cursor() as cur:
+        if cur is None:
+            return
+        
+        cur.execute("""
+            INSERT INTO results (
+                job_id, company_name, city, state, status,
+                primary_email, secondary_email, admin_email, careers_email,
+                website, email_sources, confidence, run_id, emails_found, cost, error
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+        """, (
+            job_id,
+            result.get('company_name'),
+            result.get('city'),
+            result.get('state'),
+            result.get('status'),
+            result.get('primary_email'),
+            result.get('secondary_email'),
+            result.get('admin_email'),
+            result.get('careers_email'),
+            result.get('website'),
+            result.get('email_sources'),
+            result.get('confidence'),
+            result.get('run_id'),
+            result.get('emails_found', 0),
+            result.get('cost', 0),
+            result.get('error')
+        ))
+
+
+def update_job_status_db(job_id: str, updates: dict):
+    """Update job status in database"""
+    with db_cursor() as cur:
+        if cur is None:
+            return
+        
+        set_clauses = []
+        values = []
+        for key, value in updates.items():
+            set_clauses.append(f"{key} = %s")
+            values.append(value)
+        values.append(job_id)
+        
+        cur.execute(f"""
+            UPDATE jobs SET {', '.join(set_clauses)} WHERE job_id = %s
+        """, values)
+
+
+def create_job_db(job_id: str, job_data: dict):
+    """Create a new job in the database"""
+    with db_cursor() as cur:
+        if cur is None:
+            return
+        
+        cur.execute("""
+            INSERT INTO jobs (
+                job_id, status, total_rows, processed_rows, emails_found,
+                estimated_cost, actual_cost, success_count, fail_count, processor
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            job_id,
+            job_data.get('status', 'pending'),
+            job_data.get('total_rows', 0),
+            job_data.get('processed_rows', 0),
+            job_data.get('emails_found', 0),
+            job_data.get('estimated_cost', 0),
+            job_data.get('actual_cost', 0),
+            job_data.get('success_count', 0),
+            job_data.get('fail_count', 0),
+            job_data.get('processor', 'base')
+        ))
+
+
+def get_job_from_db(job_id: str) -> Optional[dict]:
+    """Get job from database"""
+    with db_cursor() as cur:
+        if cur is None:
+            return None
+        
+        cur.execute("SELECT * FROM jobs WHERE job_id = %s", (job_id,))
+        row = cur.fetchone()
+        if row:
+            return dict(row)
+    return None
+
+
+def get_results_from_db(job_id: str) -> list:
+    """Get all results for a job from database"""
+    with db_cursor() as cur:
+        if cur is None:
+            return []
+        
+        cur.execute("""
+            SELECT company_name, city, state, status, primary_email, secondary_email,
+                   admin_email, careers_email, website, email_sources, confidence,
+                   run_id, emails_found, cost, error
+            FROM results WHERE job_id = %s ORDER BY id
+        """, (job_id,))
+        return [dict(row) for row in cur.fetchall()]
+
+
 def save_incremental_results(job_id: str, results: list):
-    """Save results incrementally to prevent data loss"""
+    """Save results incrementally to prevent data loss (file-based fallback)"""
     # Save JSON
     json_file = RESULTS_DIR / f"{job_id}_results.json"
     with open(json_file, 'w') as f:
@@ -141,7 +354,13 @@ def save_incremental_results(job_id: str, results: list):
 
 
 def load_existing_results(job_id: str) -> list:
-    """Load existing results if resuming a job"""
+    """Load existing results - try database first, then file"""
+    # Try database first
+    db_results = get_results_from_db(job_id)
+    if db_results:
+        return db_results
+    
+    # Fall back to file
     json_file = RESULTS_DIR / f"{job_id}_results.json"
     if json_file.exists():
         with open(json_file, 'r') as f:
@@ -342,18 +561,31 @@ def run_enrichment_job(job_id: str, companies: list, processor: str, api_key: st
             else:
                 fail_count += 1
             
-            # Update job status
+            # SAVE TO DATABASE IMMEDIATELY (every result)
+            save_result_to_db(job_id, result)
+            
+            # Update job status in memory
             JOBS[job_id]['processed_rows'] = company_num
             JOBS[job_id]['emails_found'] = total_emails
             JOBS[job_id]['actual_cost'] = actual_cost
             JOBS[job_id]['success_count'] = success_count
             JOBS[job_id]['fail_count'] = fail_count
             
-            # INCREMENTAL SAVE - Save every N companies
+            # Update job status in database
+            update_job_status_db(job_id, {
+                'processed_rows': company_num,
+                'emails_found': total_emails,
+                'actual_cost': actual_cost,
+                'success_count': success_count,
+                'fail_count': fail_count
+            })
+            
+            # INCREMENTAL SAVE to files - Save every N companies
             if company_num % SAVE_EVERY_N == 0:
                 save_incremental_results(job_id, results)
                 log_message(job_id, f"💾 AUTO-SAVED: {company_num}/{total} companies processed")
                 log_message(job_id, f"   ✓ Success: {success_count} | ✗ Failed: {fail_count} | 📧 Emails: {total_emails}")
+                log_message(job_id, f"   📊 Database: Results persisted to PostgreSQL")
             
             # Progress summary every 10 companies
             if company_num % 10 == 0:
@@ -378,6 +610,12 @@ def run_enrichment_job(job_id: str, companies: list, processor: str, api_key: st
         
         JOBS[job_id]['status'] = 'completed'
         JOBS[job_id]['end_time'] = datetime.now().isoformat()
+        
+        # Update final status in database
+        update_job_status_db(job_id, {
+            'status': 'completed',
+            'end_time': datetime.now()
+        })
         
         elapsed = (datetime.fromisoformat(JOBS[job_id]['end_time']) -
                    datetime.fromisoformat(JOBS[job_id]['start_time'])).total_seconds()
@@ -404,8 +642,16 @@ def run_enrichment_job(job_id: str, companies: list, processor: str, api_key: st
         JOBS[job_id]['status'] = 'failed'
         JOBS[job_id]['error'] = str(e)
         JOBS[job_id]['end_time'] = datetime.now().isoformat()
+        
+        # Update failure status in database
+        update_job_status_db(job_id, {
+            'status': 'failed',
+            'error': str(e),
+            'end_time': datetime.now()
+        })
+        
         log_message(job_id, f"❌ JOB FAILED: {str(e)}", "ERROR")
-        log_message(job_id, f"💡 TIP: Your partial results have been saved. Download them from the results link.")
+        log_message(job_id, f"💡 TIP: Your partial results have been saved to PostgreSQL. Download them from the results link.")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -781,7 +1027,7 @@ async def upload_csv(
     # Initialize job
     estimated_cost = len(companies) * COST_PER_RUN.get(processor, 0.05)
     
-    JOBS[job_id] = {
+    job_data = {
         'job_id': job_id,
         'status': 'pending',
         'total_rows': len(companies),
@@ -793,8 +1039,14 @@ async def upload_csv(
         'end_time': None,
         'error': None,
         'success_count': 0,
-        'fail_count': 0
+        'fail_count': 0,
+        'processor': processor
     }
+    
+    JOBS[job_id] = job_data
+    
+    # Save job to database
+    create_job_db(job_id, job_data)
     
     # Initialize log queue
     LOG_QUEUES[job_id] = Queue()
@@ -855,21 +1107,28 @@ async def stream_logs(job_id: str):
 
 @app.get("/results/{job_id}.json")
 async def download_json_results(job_id: str):
-    """Download results as JSON (works even during processing due to incremental saves)"""
-    results_file = RESULTS_DIR / f"{job_id}_results.json"
-    if not results_file.exists():
-        raise HTTPException(status_code=404, detail="Results not found yet. Processing may still be in progress.")
+    """Download results as JSON - from database or file"""
+    # Try database first
+    results = get_results_from_db(job_id)
     
-    with open(results_file, 'r') as f:
-        results = json.load(f)
+    # Fall back to file
+    if not results:
+        results_file = RESULTS_DIR / f"{job_id}_results.json"
+        if not results_file.exists():
+            raise HTTPException(status_code=404, detail="Results not found yet. Processing may still be in progress.")
+        
+        with open(results_file, 'r') as f:
+            results = json.load(f)
     
-    # Add metadata
-    job_info = JOBS.get(job_id, {})
+    # Get job info from memory or database
+    job_info = JOBS.get(job_id) or get_job_from_db(job_id) or {}
+    
     response = {
         "job_status": job_info.get('status', 'unknown'),
         "processed": job_info.get('processed_rows', len(results)),
         "total": job_info.get('total_rows', len(results)),
         "emails_found": job_info.get('emails_found', 0),
+        "source": "postgresql" if get_results_from_db(job_id) else "file",
         "results": results
     }
     
@@ -878,15 +1137,31 @@ async def download_json_results(job_id: str):
 
 @app.get("/results/{job_id}.csv")
 async def download_csv_results(job_id: str):
-    """Download results as CSV (works even during processing due to incremental saves)"""
-    results_file = RESULTS_DIR / f"{job_id}_results.csv"
-    if not results_file.exists():
-        raise HTTPException(status_code=404, detail="Results not found yet. Processing may still be in progress.")
+    """Download results as CSV - from database or file"""
+    # Try database first
+    results = get_results_from_db(job_id)
     
-    with open(results_file, 'r') as f:
-        content = f.read()
+    if results:
+        # Generate CSV from database results
+        import io
+        output = io.StringIO()
+        fieldnames = ['status', 'company_name', 'city', 'state', 'primary_email',
+                     'secondary_email', 'admin_email', 'careers_email', 'website',
+                     'email_sources', 'confidence', 'run_id', 'emails_found', 'cost', 'error']
+        writer = csv.DictWriter(output, fieldnames=[k for k in fieldnames if any(k in r for r in results)])
+        writer.writeheader()
+        writer.writerows(results)
+        content = output.getvalue()
+    else:
+        # Fall back to file
+        results_file = RESULTS_DIR / f"{job_id}_results.csv"
+        if not results_file.exists():
+            raise HTTPException(status_code=404, detail="Results not found yet. Processing may still be in progress.")
+        
+        with open(results_file, 'r') as f:
+            content = f.read()
     
-    job_info = JOBS.get(job_id, {})
+    job_info = JOBS.get(job_id) or get_job_from_db(job_id) or {}
     status_suffix = "_partial" if job_info.get('status') == 'running' else ""
     
     return StreamingResponse(
