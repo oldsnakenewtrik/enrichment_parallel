@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+.eggs/
+*.egg-info/
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# App data
+uploads/
+results/
+*.csv
+*.json
+!railway.json
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
