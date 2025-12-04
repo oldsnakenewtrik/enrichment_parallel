@@ -52,6 +52,9 @@ COST_PER_RUN = {
     "core": 0.10,
 }
 
+# Incremental save settings
+SAVE_EVERY_N = 5  # Save results every N companies
+
 # Schemas for deep email search
 class CompanyInput(BaseModel):
     company_name: str = Field(description="Name of the assisted living facility or company")
@@ -116,13 +119,45 @@ def log_message(job_id: str, message: str, level: str = "INFO"):
     print(f"[{job_id[:8]}] {log_entry}")
 
 
+def save_incremental_results(job_id: str, results: list):
+    """Save results incrementally to prevent data loss"""
+    # Save JSON
+    json_file = RESULTS_DIR / f"{job_id}_results.json"
+    with open(json_file, 'w') as f:
+        json.dump(results, f, indent=2)
+    
+    # Save CSV
+    csv_file = RESULTS_DIR / f"{job_id}_results.csv"
+    if results:
+        with open(csv_file, 'w', newline='', encoding='utf-8') as f:
+            fieldnames = ['status', 'company_name', 'city', 'state', 'primary_email',
+                         'secondary_email', 'admin_email', 'careers_email', 'website',
+                         'email_sources', 'confidence', 'run_id', 'emails_found', 'cost', 'error']
+            writer = csv.DictWriter(f, fieldnames=[k for k in fieldnames if any(k in r for r in results)])
+            writer.writeheader()
+            writer.writerows(results)
+    
+    return json_file, csv_file
+
+
+def load_existing_results(job_id: str) -> list:
+    """Load existing results if resuming a job"""
+    json_file = RESULTS_DIR / f"{job_id}_results.json"
+    if json_file.exists():
+        with open(json_file, 'r') as f:
+            return json.load(f)
+    return []
+
+
 def process_enrichment_with_retry(
     client: Parallel,
     company: dict,
     task_spec: dict,
     processor: str,
     max_retries: int = 3,
-    job_id: str = None
+    job_id: str = None,
+    company_index: int = 0,
+    total_companies: int = 0
 ) -> dict:
     """Process a single company with retry logic"""
     
@@ -134,9 +169,12 @@ def process_enrichment_with_retry(
         "phone": company.get('phone')
     }
     
+    progress_prefix = f"[{company_index}/{total_companies}]"
+    
     for attempt in range(max_retries):
         try:
-            log_message(job_id, f"Attempt {attempt + 1}/{max_retries} for {company['company_name']}")
+            log_message(job_id, f"{progress_prefix} Attempt {attempt + 1}/{max_retries} for: {company['company_name']}")
+            log_message(job_id, f"{progress_prefix} Location: {company.get('city', 'N/A')}, {company.get('state', 'N/A')}")
             
             # Create task run
             task_run = client.task_run.create(
@@ -145,14 +183,18 @@ def process_enrichment_with_retry(
                 processor=processor
             )
             
-            log_message(job_id, f"Run ID: {task_run.run_id}")
+            log_message(job_id, f"{progress_prefix} API Run ID: {task_run.run_id}")
             
             # Poll for result with extended timeout
             start_time = time.time()
             max_wait = 180  # 3 minutes max per company
+            poll_count = 0
             
             while time.time() - start_time < max_wait:
                 try:
+                    poll_count += 1
+                    elapsed = int(time.time() - start_time)
+                    
                     result = client.task_run.result(task_run.run_id, api_timeout=30)
                     
                     if result.run.status == "completed":
@@ -162,7 +204,15 @@ def process_enrichment_with_retry(
                         email_fields = ['primary_email', 'secondary_email', 'admin_email', 'careers_email']
                         emails = [output.get(f) for f in email_fields if output.get(f)]
                         
-                        log_message(job_id, f"SUCCESS: Found {len(emails)} email(s)")
+                        log_message(job_id, f"{progress_prefix} ✓ SUCCESS: Found {len(emails)} email(s) in {elapsed}s")
+                        
+                        # Log each email found
+                        for field in email_fields:
+                            if output.get(field):
+                                log_message(job_id, f"{progress_prefix}   - {field}: {output.get(field)}")
+                        
+                        if output.get('website'):
+                            log_message(job_id, f"{progress_prefix}   - website: {output.get('website')}")
                         
                         return {
                             'status': 'success',
@@ -186,7 +236,8 @@ def process_enrichment_with_retry(
                     
                 except Exception as e:
                     if "408" in str(e) or "still active" in str(e).lower():
-                        log_message(job_id, f"Still processing... ({int(time.time() - start_time)}s)")
+                        if poll_count % 3 == 0:  # Log every 3rd poll to reduce noise
+                            log_message(job_id, f"{progress_prefix} ⏳ Still researching... ({elapsed}s elapsed)")
                         time.sleep(10)
                     else:
                         raise
@@ -195,17 +246,19 @@ def process_enrichment_with_retry(
             raise Exception(f"Timeout after {max_wait}s")
             
         except Exception as e:
-            log_message(job_id, f"Attempt {attempt + 1} failed: {str(e)}", "WARN")
+            log_message(job_id, f"{progress_prefix} ⚠ Attempt {attempt + 1} failed: {str(e)}", "WARN")
             
             if attempt < max_retries - 1:
                 wait_time = (attempt + 1) * 10  # Exponential backoff
-                log_message(job_id, f"Retrying in {wait_time}s...")
+                log_message(job_id, f"{progress_prefix} Retrying in {wait_time}s...")
                 time.sleep(wait_time)
             else:
-                log_message(job_id, f"All retries failed for {company['company_name']}", "ERROR")
+                log_message(job_id, f"{progress_prefix} ✗ FAILED: All {max_retries} retries exhausted for {company['company_name']}", "ERROR")
                 return {
                     'status': 'failed',
                     'company_name': company['company_name'],
+                    'city': company.get('city'),
+                    'state': company.get('state'),
                     'error': str(e),
                     'emails_found': 0,
                     'cost': COST_PER_RUN.get(processor, 0.05)  # Still charged for attempt
@@ -214,15 +267,26 @@ def process_enrichment_with_retry(
     return {'status': 'failed', 'company_name': company['company_name'], 'emails_found': 0, 'cost': 0}
 
 
-def run_enrichment_job(job_id: str, companies: list, processor: str, api_key: str):
-    """Background job to process all companies"""
+def run_enrichment_job(job_id: str, companies: list, processor: str, api_key: str, start_index: int = 0):
+    """Background job to process all companies with incremental saves"""
     
     try:
         JOBS[job_id]['status'] = 'running'
         JOBS[job_id]['start_time'] = datetime.now().isoformat()
         
-        log_message(job_id, f"Starting enrichment job with {len(companies)} companies")
-        log_message(job_id, f"Processor: {processor}, Est. cost: ${len(companies) * COST_PER_RUN.get(processor, 0.05):.2f}")
+        total = len(companies)
+        log_message(job_id, "=" * 60)
+        log_message(job_id, f"🚀 STARTING ENRICHMENT JOB")
+        log_message(job_id, f"=" * 60)
+        log_message(job_id, f"📊 Total companies: {total}")
+        log_message(job_id, f"⚙️  Processor: {processor}")
+        log_message(job_id, f"💰 Estimated cost: ${total * COST_PER_RUN.get(processor, 0.05):.2f}")
+        log_message(job_id, f"💾 Auto-save: Every {SAVE_EVERY_N} companies")
+        
+        if start_index > 0:
+            log_message(job_id, f"🔄 RESUMING from company #{start_index + 1}")
+        
+        log_message(job_id, "=" * 60)
         
         client = Parallel(api_key=api_key)
         
@@ -238,12 +302,24 @@ def run_enrichment_job(job_id: str, companies: list, processor: str, api_key: st
             },
         }
         
-        results = []
-        total_emails = 0
-        actual_cost = 0.0
+        # Load existing results if resuming
+        results = load_existing_results(job_id)
+        total_emails = sum(r.get('emails_found', 0) for r in results)
+        actual_cost = sum(r.get('cost', 0) for r in results)
         
-        for idx, company in enumerate(companies):
-            log_message(job_id, f"Processing {idx + 1}/{len(companies)}: {company['company_name']}")
+        # Track success/failure counts
+        success_count = len([r for r in results if r.get('status') == 'success'])
+        fail_count = len([r for r in results if r.get('status') == 'failed'])
+        
+        # Process remaining companies
+        for idx in range(start_index, total):
+            company = companies[idx]
+            company_num = idx + 1
+            
+            log_message(job_id, "")
+            log_message(job_id, f"{'─' * 50}")
+            log_message(job_id, f"📍 COMPANY {company_num}/{total}: {company['company_name']}")
+            log_message(job_id, f"{'─' * 50}")
             
             result = process_enrichment_with_retry(
                 client=client,
@@ -251,48 +327,85 @@ def run_enrichment_job(job_id: str, companies: list, processor: str, api_key: st
                 task_spec=task_spec,
                 processor=processor,
                 max_retries=3,
-                job_id=job_id
+                job_id=job_id,
+                company_index=company_num,
+                total_companies=total
             )
             
             results.append(result)
             total_emails += result.get('emails_found', 0)
             actual_cost += result.get('cost', 0)
             
+            # Update counts
+            if result.get('status') == 'success':
+                success_count += 1
+            else:
+                fail_count += 1
+            
             # Update job status
-            JOBS[job_id]['processed_rows'] = idx + 1
+            JOBS[job_id]['processed_rows'] = company_num
             JOBS[job_id]['emails_found'] = total_emails
             JOBS[job_id]['actual_cost'] = actual_cost
+            JOBS[job_id]['success_count'] = success_count
+            JOBS[job_id]['fail_count'] = fail_count
+            
+            # INCREMENTAL SAVE - Save every N companies
+            if company_num % SAVE_EVERY_N == 0:
+                save_incremental_results(job_id, results)
+                log_message(job_id, f"💾 AUTO-SAVED: {company_num}/{total} companies processed")
+                log_message(job_id, f"   ✓ Success: {success_count} | ✗ Failed: {fail_count} | 📧 Emails: {total_emails}")
+            
+            # Progress summary every 10 companies
+            if company_num % 10 == 0:
+                elapsed = (datetime.now() - datetime.fromisoformat(JOBS[job_id]['start_time'])).total_seconds()
+                rate = company_num / elapsed if elapsed > 0 else 0
+                remaining = total - company_num
+                eta_seconds = remaining / rate if rate > 0 else 0
+                eta_minutes = eta_seconds / 60
+                
+                log_message(job_id, "")
+                log_message(job_id, f"📈 PROGRESS SUMMARY ({company_num}/{total} - {company_num*100//total}%)")
+                log_message(job_id, f"   ⏱️  Elapsed: {int(elapsed//60)}m {int(elapsed%60)}s")
+                log_message(job_id, f"   🚀 Rate: {rate:.1f} companies/min")
+                log_message(job_id, f"   ⏳ ETA: ~{int(eta_minutes)}m remaining")
+                log_message(job_id, f"   💰 Cost so far: ${actual_cost:.2f}")
             
             # Rate limiting - small delay between requests
             time.sleep(1)
         
-        # Save results
-        results_file = RESULTS_DIR / f"{job_id}_results.json"
-        with open(results_file, 'w') as f:
-            json.dump(results, f, indent=2)
-        
-        # Also save as CSV
-        csv_file = RESULTS_DIR / f"{job_id}_results.csv"
-        if results:
-            with open(csv_file, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=results[0].keys())
-                writer.writeheader()
-                writer.writerows(results)
+        # Final save
+        json_file, csv_file = save_incremental_results(job_id, results)
         
         JOBS[job_id]['status'] = 'completed'
         JOBS[job_id]['end_time'] = datetime.now().isoformat()
         
-        log_message(job_id, f"JOB COMPLETED!")
-        log_message(job_id, f"Total companies: {len(companies)}")
-        log_message(job_id, f"Total emails found: {total_emails}")
-        log_message(job_id, f"Total cost: ${actual_cost:.2f}")
-        log_message(job_id, f"Results saved to: {results_file}")
+        elapsed = (datetime.fromisoformat(JOBS[job_id]['end_time']) -
+                   datetime.fromisoformat(JOBS[job_id]['start_time'])).total_seconds()
+        
+        log_message(job_id, "")
+        log_message(job_id, "=" * 60)
+        log_message(job_id, f"🎉 JOB COMPLETED!")
+        log_message(job_id, "=" * 60)
+        log_message(job_id, f"📊 Total companies: {total}")
+        log_message(job_id, f"✅ Successful: {success_count}")
+        log_message(job_id, f"❌ Failed: {fail_count}")
+        log_message(job_id, f"📧 Total emails found: {total_emails}")
+        log_message(job_id, f"💰 Total cost: ${actual_cost:.2f}")
+        log_message(job_id, f"⏱️  Total time: {int(elapsed//60)}m {int(elapsed%60)}s")
+        log_message(job_id, f"💾 Results saved: {json_file}")
+        log_message(job_id, "=" * 60)
         
     except Exception as e:
+        # Save whatever we have before marking as failed
+        if 'results' in dir() and results:
+            save_incremental_results(job_id, results)
+            log_message(job_id, f"💾 EMERGENCY SAVE: Saved {len(results)} results before failure")
+        
         JOBS[job_id]['status'] = 'failed'
         JOBS[job_id]['error'] = str(e)
         JOBS[job_id]['end_time'] = datetime.now().isoformat()
-        log_message(job_id, f"JOB FAILED: {str(e)}", "ERROR")
+        log_message(job_id, f"❌ JOB FAILED: {str(e)}", "ERROR")
+        log_message(job_id, f"💡 TIP: Your partial results have been saved. Download them from the results link.")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -429,6 +542,16 @@ async def index():
                 <div class="stat-label">Emails Found</div>
             </div>
             <div class="stat">
+                <div class="stat-value" id="statSuccess" style="color: #28a745;">0</div>
+                <div class="stat-label">✓ Success</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value" id="statFailed" style="color: #dc3545;">0</div>
+                <div class="stat-label">✗ Failed</div>
+            </div>
+        </div>
+        <div class="status" style="margin-top: -5px;">
+            <div class="stat">
                 <div class="stat-value" id="statCost">$0.00</div>
                 <div class="stat-label">Cost</div>
             </div>
@@ -436,10 +559,16 @@ async def index():
                 <div class="stat-value" id="statStatus">-</div>
                 <div class="stat-label">Status</div>
             </div>
+            <div class="stat" style="grid-column: span 2;">
+                <div class="stat-value" id="statETA">-</div>
+                <div class="stat-label">Estimated Time</div>
+            </div>
         </div>
-        <div id="downloadLinks" style="display:none; margin-bottom: 15px;">
-            <a href="#" id="jsonLink" target="_blank">Download JSON Results</a> | 
-            <a href="#" id="csvLink" target="_blank">Download CSV Results</a>
+        <div id="downloadLinks" style="margin-bottom: 15px; padding: 10px; background: #e8f5e9; border-radius: 4px;">
+            <strong>📥 Download Results:</strong>
+            <a href="#" id="jsonLink" target="_blank">JSON</a> |
+            <a href="#" id="csvLink" target="_blank">CSV</a>
+            <span id="partialWarning" style="color: #ff9800; margin-left: 10px;"></span>
         </div>
         <h3>Live Logs</h3>
         <div class="logs" id="logs"></div>
@@ -534,32 +663,66 @@ async def index():
             };
         }
         
+        let pollStartTime = null;
+        
         function pollStatus(jobId) {
+            if (!pollStartTime) pollStartTime = Date.now();
+            
             const poll = async () => {
                 try {
                     const response = await fetch('/status/' + jobId);
                     const status = await response.json();
                     
-                    const progress = status.total_rows > 0 
-                        ? (status.processed_rows / status.total_rows * 100) 
+                    const progress = status.total_rows > 0
+                        ? (status.processed_rows / status.total_rows * 100)
                         : 0;
                     
                     document.getElementById('progressBar').style.width = progress + '%';
-                    document.getElementById('statProcessed').textContent = 
+                    document.getElementById('statProcessed').textContent =
                         status.processed_rows + '/' + status.total_rows;
                     document.getElementById('statEmails').textContent = status.emails_found;
+                    document.getElementById('statSuccess').textContent = status.success_count || 0;
+                    document.getElementById('statFailed').textContent = status.fail_count || 0;
                     document.getElementById('statCost').textContent = '$' + status.actual_cost.toFixed(2);
                     document.getElementById('statStatus').textContent = status.status.toUpperCase();
+                    
+                    // Calculate ETA
+                    if (status.processed_rows > 0 && status.status === 'running') {
+                        const elapsed = (Date.now() - pollStartTime) / 1000;
+                        const rate = status.processed_rows / elapsed;
+                        const remaining = status.total_rows - status.processed_rows;
+                        const etaSeconds = remaining / rate;
+                        const etaMin = Math.floor(etaSeconds / 60);
+                        const etaSec = Math.floor(etaSeconds % 60);
+                        document.getElementById('statETA').textContent = etaMin + 'm ' + etaSec + 's';
+                    } else if (status.status === 'completed') {
+                        document.getElementById('statETA').textContent = 'Done!';
+                    } else if (status.status === 'failed') {
+                        document.getElementById('statETA').textContent = 'Failed';
+                    }
+                    
+                    // Show download links after first save (5 companies) or on completion/failure
+                    if (status.processed_rows >= 5 || status.status === 'completed' || status.status === 'failed') {
+                        document.getElementById('downloadLinks').style.display = 'block';
+                        document.getElementById('jsonLink').href = '/results/' + jobId + '.json';
+                        document.getElementById('csvLink').href = '/results/' + jobId + '.csv';
+                        
+                        if (status.status === 'running') {
+                            document.getElementById('partialWarning').textContent = '⚠️ Partial results (job still running)';
+                            document.getElementById('downloadLinks').style.background = '#fff3cd';
+                        } else if (status.status === 'failed') {
+                            document.getElementById('partialWarning').textContent = '⚠️ Partial results (job failed)';
+                            document.getElementById('downloadLinks').style.background = '#ffebee';
+                        } else {
+                            document.getElementById('partialWarning').textContent = '✓ Complete results';
+                            document.getElementById('downloadLinks').style.background = '#e8f5e9';
+                        }
+                    }
                     
                     if (status.status === 'completed' || status.status === 'failed') {
                         document.getElementById('startBtn').disabled = false;
                         if (eventSource) eventSource.close();
-                        
-                        if (status.status === 'completed') {
-                            document.getElementById('downloadLinks').style.display = 'block';
-                            document.getElementById('jsonLink').href = '/results/' + jobId + '.json';
-                            document.getElementById('csvLink').href = '/results/' + jobId + '.csv';
-                        }
+                        pollStartTime = null;
                     } else {
                         setTimeout(poll, 2000);
                     }
@@ -632,7 +795,9 @@ async def upload_csv(
         'actual_cost': 0.0,
         'start_time': None,
         'end_time': None,
-        'error': None
+        'error': None,
+        'success_count': 0,
+        'fail_count': 0
     }
     
     # Initialize log queue
@@ -641,7 +806,7 @@ async def upload_csv(
     # Start background job
     thread = threading.Thread(
         target=run_enrichment_job,
-        args=(job_id, companies, processor, api_key)
+        args=(job_id, companies, processor, api_key, 0)
     )
     thread.daemon = True
     thread.start()
@@ -694,31 +859,44 @@ async def stream_logs(job_id: str):
 
 @app.get("/results/{job_id}.json")
 async def download_json_results(job_id: str):
-    """Download results as JSON"""
+    """Download results as JSON (works even during processing due to incremental saves)"""
     results_file = RESULTS_DIR / f"{job_id}_results.json"
     if not results_file.exists():
-        raise HTTPException(status_code=404, detail="Results not found")
+        raise HTTPException(status_code=404, detail="Results not found yet. Processing may still be in progress.")
     
     with open(results_file, 'r') as f:
         results = json.load(f)
     
-    return JSONResponse(content=results)
+    # Add metadata
+    job_info = JOBS.get(job_id, {})
+    response = {
+        "job_status": job_info.get('status', 'unknown'),
+        "processed": job_info.get('processed_rows', len(results)),
+        "total": job_info.get('total_rows', len(results)),
+        "emails_found": job_info.get('emails_found', 0),
+        "results": results
+    }
+    
+    return JSONResponse(content=response)
 
 
 @app.get("/results/{job_id}.csv")
 async def download_csv_results(job_id: str):
-    """Download results as CSV"""
+    """Download results as CSV (works even during processing due to incremental saves)"""
     results_file = RESULTS_DIR / f"{job_id}_results.csv"
     if not results_file.exists():
-        raise HTTPException(status_code=404, detail="Results not found")
+        raise HTTPException(status_code=404, detail="Results not found yet. Processing may still be in progress.")
     
     with open(results_file, 'r') as f:
         content = f.read()
     
+    job_info = JOBS.get(job_id, {})
+    status_suffix = "_partial" if job_info.get('status') == 'running' else ""
+    
     return StreamingResponse(
         iter([content]),
         media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename=enrichment_results_{job_id[:8]}.csv"}
+        headers={"Content-Disposition": f"attachment; filename=enrichment_results_{job_id[:8]}{status_suffix}.csv"}
     )
 
 
