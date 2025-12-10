@@ -800,11 +800,11 @@ async def index():
             </div>
             <div class="stat">
                 <div class="stat-value" id="statSuccess" style="color: #28a745;">0</div>
-                <div class="stat-label">✓ Success</div>
+                <div class="stat-label">Success</div>
             </div>
             <div class="stat">
                 <div class="stat-value" id="statFailed" style="color: #dc3545;">0</div>
-                <div class="stat-label">✗ Failed</div>
+                <div class="stat-label">Failed</div>
             </div>
         </div>
         <div class="status" style="margin-top: -5px;">
@@ -822,7 +822,7 @@ async def index():
             </div>
         </div>
         <div id="downloadLinks" style="margin-bottom: 15px; padding: 10px; background: #e8f5e9; border-radius: 4px;">
-            <strong>📥 Download Results:</strong>
+            <strong>Download Results:</strong>
             <a href="#" id="jsonLink" target="_blank">JSON</a> |
             <a href="#" id="csvLink" target="_blank">CSV</a>
             <span id="partialWarning" style="color: #ff9800; margin-left: 10px;"></span>
@@ -965,13 +965,13 @@ async def index():
                         document.getElementById('csvLink').href = '/results/' + jobId + '.csv';
                         
                         if (status.status === 'running') {
-                            document.getElementById('partialWarning').textContent = '⚠️ Partial results (job still running)';
+                            document.getElementById('partialWarning').textContent = '[!] Partial results (job still running)';
                             document.getElementById('downloadLinks').style.background = '#fff3cd';
                         } else if (status.status === 'failed') {
-                            document.getElementById('partialWarning').textContent = '⚠️ Partial results (job failed)';
+                            document.getElementById('partialWarning').textContent = '[!] Partial results (job failed)';
                             document.getElementById('downloadLinks').style.background = '#ffebee';
                         } else {
-                            document.getElementById('partialWarning').textContent = '✓ Complete results';
+                            document.getElementById('partialWarning').textContent = '[OK] Complete results';
                             document.getElementById('downloadLinks').style.background = '#e8f5e9';
                         }
                     }
