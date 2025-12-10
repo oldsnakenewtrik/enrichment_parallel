@@ -668,7 +668,7 @@ def run_enrichment_job(job_id: str, companies: list, processor: str, api_key: st
 async def index():
     """Serve the main UI"""
     from fastapi.responses import Response
-    html_content = r"""
+    html_content = """
 <!DOCTYPE html>
 <html>
 <head>
