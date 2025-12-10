@@ -668,7 +668,7 @@ def run_enrichment_job(job_id: str, companies: list, processor: str, api_key: st
 async def index():
     """Serve the main UI"""
     from fastapi.responses import Response
-    html_content = """
+    html_content = r"""
 <!DOCTYPE html>
 <html>
 <head>
@@ -994,7 +994,9 @@ async def index():
 </body>
 </html>
     """
-    return Response(content=html_content, media_type="text/html; charset=utf-8")
+    # Encode to bytes so Content-Length header is calculated correctly for UTF-8 characters
+    html_bytes = html_content.encode('utf-8')
+    return Response(content=html_bytes, media_type="text/html; charset=utf-8")
 
 
 @app.post("/upload")
