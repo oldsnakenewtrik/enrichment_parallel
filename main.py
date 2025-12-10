@@ -1023,24 +1023,76 @@ async def upload_csv(
     with open(upload_path, 'wb') as f:
         f.write(content)
     
-    # Parse CSV
+    # Parse CSV with flexible column detection
     companies = []
     content_str = content.decode('utf-8')
-    reader = csv.reader(content_str.splitlines())
+    lines = content_str.splitlines()
     
-    for row in reader:
-        if len(row) >= 4:
+    if not lines:
+        raise HTTPException(status_code=400, detail="CSV file is empty")
+    
+    # Try to detect if first row is a header
+    first_line = lines[0].lower()
+    has_header = 'company' in first_line or 'name' in first_line or 'address' in first_line
+    
+    if has_header:
+        # Use DictReader for header-based parsing
+        reader = csv.DictReader(lines)
+        for row in reader:
+            # Normalize keys to lowercase for matching
+            row_lower = {k.lower().strip(): v for k, v in row.items()}
+            
+            # Try to find company name from various possible column names
+            company_name = (
+                row_lower.get('company_name') or
+                row_lower.get('company') or
+                row_lower.get('name') or
+                row_lower.get('business_name') or
+                row_lower.get('facility_name') or
+                ''
+            )
+            
+            if not company_name or not company_name.strip():
+                continue  # Skip rows without company name
+            
+            # Extract city from address if not separate column
+            address = row_lower.get('address') or row_lower.get('street') or ''
+            city = row_lower.get('city') or ''
+            state = row_lower.get('state') or ''
+            
+            # If no separate city column, try to extract from address (format: "street, city, state zip")
+            if not city and address:
+                # Try to parse city from address like "360 Sherman St, Ste 450, Saint Paul, MN 55102"
+                parts = [p.strip() for p in address.split(',')]
+                if len(parts) >= 3:
+                    # Last part usually contains state and zip
+                    # Second to last is often city
+                    city = parts[-2] if len(parts) >= 2 else ''
+            
             companies.append({
-                'company_name': row[0],
-                'address': row[1] if len(row) > 1 else '',
-                'city': row[2] if len(row) > 2 else '',
-                'state': row[3] if len(row) > 3 else '',
-                'zip_code': row[4] if len(row) > 4 else '',
-                'phone': row[7] if len(row) > 7 else None
+                'company_name': company_name.strip(),
+                'address': address.strip(),
+                'city': city.strip(),
+                'state': state.strip(),
+                'zip_code': row_lower.get('zip') or row_lower.get('zip_code') or row_lower.get('postal') or '',
+                'phone': row_lower.get('phone') or row_lower.get('telephone') or row_lower.get('number') or None
             })
+    else:
+        # Fall back to positional parsing (old format)
+        reader = csv.reader(lines)
+        for row in reader:
+            if len(row) >= 1 and row[0].strip():  # At minimum need company name
+                companies.append({
+                    'company_name': row[0].strip(),
+                    'address': row[1].strip() if len(row) > 1 else '',
+                    'city': row[2].strip() if len(row) > 2 else '',
+                    'state': row[3].strip() if len(row) > 3 else '',
+                    'zip_code': row[4].strip() if len(row) > 4 else '',
+                    'phone': row[7].strip() if len(row) > 7 else None
+                })
     
     if not companies:
-        raise HTTPException(status_code=400, detail="No valid rows found in CSV")
+        raise HTTPException(status_code=400, detail="No valid rows found in CSV. Ensure the file has a 'company_name' column (or similar) with data.")
     
     # Initialize job
     estimated_cost = len(companies) * COST_PER_RUN.get(processor, 0.05)
