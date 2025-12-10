@@ -1199,7 +1199,8 @@ async def health_check():
 @app.get("/favicon.ico")
 async def favicon():
     """Return empty favicon to prevent 404"""
-    return JSONResponse(content={}, status_code=204)
+    from starlette.responses import Response
+    return Response(status_code=204)
 
 
 if __name__ == "__main__":
