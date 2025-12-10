@@ -889,12 +889,12 @@ async def index():
                 
                 const data = await response.json();
                 
-                if (data.job_id) {
+                if (response.ok && data.job_id) {
                     currentJobId = data.job_id;
                     connectToLogs(data.job_id);
                     pollStatus(data.job_id);
                 } else {
-                    alert('Error: ' + (data.error || 'Unknown error'));
+                    alert('Error: ' + (data.detail || data.error || JSON.stringify(data)));
                     document.getElementById('startBtn').disabled = false;
                 }
             } catch (e) {
