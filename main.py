@@ -870,8 +870,8 @@ async def index():
 
         <div class="form-row">
             <div class="form-group">
-                <label>Match Limit (max entities to find)</label>
-                <input type="number" id="matchLimit" value="50" min="1" max="1000">
+                <label>Match Limit (max entities to find, API limit: 5-1000)</label>
+                <input type="number" id="matchLimit" value="50" min="5" max="1000">
             </div>
             <div class="form-group">
                 <label>Parallel API Key</label>
@@ -928,7 +928,8 @@ async def index():
         }
 
         function updateCostEstimate() {
-            const matchLimit = parseInt(document.getElementById('matchLimit').value) || 50;
+            let matchLimit = parseInt(document.getElementById('matchLimit').value) || 50;
+            matchLimit = Math.max(5, Math.min(1000, matchLimit)); // Enforce API limits
             const generator = document.getElementById('generator').value;
             const cost = matchLimit * (COSTS[generator] || 0.23);
             document.getElementById('estimatedCost').textContent = '$' + cost.toFixed(2);
@@ -942,7 +943,8 @@ async def index():
             const objective = document.getElementById('objective').value.trim();
             const entityType = document.getElementById('entityType').value;
             const generator = document.getElementById('generator').value;
-            const matchLimit = parseInt(document.getElementById('matchLimit').value) || 50;
+            let matchLimit = parseInt(document.getElementById('matchLimit').value) || 50;
+            matchLimit = Math.max(5, Math.min(1000, matchLimit)); // Enforce API limits
             const apiKey = document.getElementById('apiKey').value;
 
             if (!objective) {
@@ -1055,7 +1057,7 @@ async def start_discovery(
     objective: str = Form(...),
     entity_type: str = Form("businesses"),
     generator: str = Form("core"),
-    match_limit: int = Form(50),
+    match_limit: int = Form(50, ge=5, le=1000),
     api_key: str = Form(...)
 ):
     """Start a FindAll discovery job"""
