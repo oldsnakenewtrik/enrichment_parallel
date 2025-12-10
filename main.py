@@ -306,7 +306,22 @@ def poll_findall_status(api_key: str, findall_id: str) -> dict:
     if response.status_code != 200:
         raise Exception(f"Status poll error: {response.status_code} - {response.text}")
 
-    return response.json()
+    result = response.json()
+    
+    # The status field is nested: {"status": {"status": "running", "is_active": true, ...}}
+    # Flatten it for easier access
+    status_obj = result.get("status", {})
+    if isinstance(status_obj, dict):
+        result["_status_str"] = status_obj.get("status", "unknown")
+        result["_is_active"] = status_obj.get("is_active", False)
+        result["_metrics"] = status_obj.get("metrics", {})
+        result["_termination_reason"] = status_obj.get("termination_reason")
+    else:
+        result["_status_str"] = status_obj
+        result["_is_active"] = False
+        result["_metrics"] = {}
+    
+    return result
 
 
 def get_findall_results(api_key: str, findall_id: str) -> dict:
@@ -329,9 +344,15 @@ def extract_entities_from_results(results: dict) -> List[dict]:
     """Extract and normalize entities from FindAll results"""
     entities = []
 
-    matches = results.get("matches", []) or results.get("results", []) or []
+    # FindAll API returns candidates array, not matches
+    candidates = (
+        results.get("candidates", []) or 
+        results.get("matches", []) or 
+        results.get("results", []) or 
+        []
+    )
 
-    for match in matches:
+    for match in candidates:
         if not isinstance(match, dict):
             continue
 
@@ -353,6 +374,11 @@ def extract_entities_from_results(results: dict) -> List[dict]:
             'raw_enrichment': {}
         }
 
+        # Skip non-matched candidates
+        match_status = match.get("match_status", "matched")
+        if match_status == "unmatched":
+            continue
+        
         # Get the entity name from various possible fields
         entity['entity_name'] = (
             match.get("name") or
@@ -363,12 +389,27 @@ def extract_entities_from_results(results: dict) -> List[dict]:
         )
 
         # Get match metadata
-        entity['confidence'] = match.get("confidence") or match.get("score")
-        entity['match_reasoning'] = match.get("reasoning") or match.get("explanation")
-        entity['source_url'] = match.get("source") or match.get("url") or match.get("citation")
+        entity['source_url'] = match.get("url") or match.get("source") or match.get("citation")
+        entity['description'] = match.get("description")
+        
+        # Extract confidence and reasoning from basis array
+        basis = match.get("basis", [])
+        if basis and isinstance(basis, list) and len(basis) > 0:
+            entity['confidence'] = basis[0].get("confidence")
+            entity['match_reasoning'] = basis[0].get("reasoning")
+        else:
+            entity['confidence'] = match.get("confidence") or match.get("score")
+            entity['match_reasoning'] = match.get("reasoning") or match.get("explanation")
 
-        # Get enrichment data
+        # Get enrichment data - check both "enrichment" and "output" fields
         enrichment = match.get("enrichment", {}) or {}
+        
+        # Also check output field for match condition values
+        output = match.get("output", {})
+        if output and isinstance(output, dict):
+            for key, val in output.items():
+                if isinstance(val, dict) and val.get("type") == "enrichment":
+                    enrichment[key] = val.get("value")
         entity['raw_enrichment'] = enrichment
 
         # Extract enriched fields
@@ -549,28 +590,35 @@ def run_findall_job(job_id: str, objective: str, entity_type: str,
         poll_count = 0
 
         while time.time() - start_time < max_wait:
+            # Check if job was cancelled
+            if JOBS.get(job_id, {}).get('status') == 'cancelled':
+                log_message(job_id, "🛑 Job cancelled by user", "WARN")
+                return
+            
             poll_count += 1
             elapsed = int(time.time() - start_time)
 
             try:
                 status_result = poll_findall_status(api_key, findall_id)
-                status = status_result.get("status", "unknown")
+                # Use flattened status from poll_findall_status
+                status = status_result.get("_status_str", "unknown")
+                is_active = status_result.get("_is_active", True)
+                metrics = status_result.get("_metrics", {})
 
                 # Log progress periodically
                 if poll_count % 6 == 0:  # Every 30 seconds
-                    candidates = status_result.get("candidates_found", 0) or status_result.get("matches_found", 0)
-                    evaluated = status_result.get("candidates_evaluated", 0)
-                    matched = status_result.get("matches", 0) or status_result.get("matched", 0)
-                    log_message(job_id, f"⏳ Progress: {elapsed}s elapsed | Candidates: {candidates} | Evaluated: {evaluated} | Matched: {matched}")
+                    candidates = metrics.get("generated_candidates_count", 0)
+                    matched = metrics.get("matched_candidates_count", 0)
+                    log_message(job_id, f"⏳ Progress: {elapsed}s elapsed | Generated: {candidates} | Matched: {matched}")
 
-                if status == "completed":
+                if status == "completed" or (not is_active and status not in ["queued", "pending"]):
                     log_message(job_id, f"✓ Discovery completed in {elapsed}s")
                     break
                 elif status == "failed":
-                    error_msg = status_result.get("error", "Unknown error")
+                    error_msg = status_result.get("_termination_reason") or status_result.get("error", "Unknown error")
                     raise Exception(f"FindAll run failed: {error_msg}")
-                elif status not in ["running", "pending", "processing"]:
-                    log_message(job_id, f"Unknown status: {status}")
+                elif status not in ["running", "pending", "processing", "queued"]:
+                    log_message(job_id, f"Status: {status} (is_active={is_active})")
 
                 time.sleep(5)
 
@@ -837,6 +885,7 @@ async def index():
         </div>
 
         <button onclick="startDiscovery()" id="startBtn">Start Discovery</button>
+        <button onclick="cancelJob()" id="cancelBtn" style="display:none; background:#dc3545; margin-left:10px;">Cancel Job</button>
     </div>
 
     <div class="card" id="statusCard" style="display:none;">
@@ -928,6 +977,7 @@ async def index():
 
                 if (data.job_id) {
                     currentJobId = data.job_id;
+                    document.getElementById('cancelBtn').style.display = 'inline-block';
                     connectToLogs(data.job_id);
                     pollStatus(data.job_id);
                 } else {
@@ -951,6 +1001,19 @@ async def index():
             };
         }
 
+        async function cancelJob() {
+            if (!currentJobId) return;
+            
+            if (!confirm('Are you sure you want to cancel this job?')) return;
+            
+            try {
+                await fetch('/cancel/' + currentJobId, { method: 'POST' });
+                document.getElementById('cancelBtn').style.display = 'none';
+            } catch (e) {
+                console.error('Cancel error:', e);
+            }
+        }
+
         function pollStatus(jobId) {
             const poll = async () => {
                 try {
@@ -962,10 +1025,10 @@ async def index():
                     document.getElementById('statPhones').textContent = status.entities_with_phone || 0;
                     document.getElementById('statStatus').textContent = (status.status || '-').toUpperCase();
 
-                    if (status.status === 'completed' || status.status === 'failed') {
+                    if (status.status === 'completed' || status.status === 'failed' || status.status === 'cancelled') {
                         document.getElementById('startBtn').disabled = false;
+                        document.getElementById('cancelBtn').style.display = 'none';
                         if (eventSource) eventSource.close();
-
                         if (status.entities_found > 0) {
                             document.getElementById('downloadLinks').style.display = 'block';
                             document.getElementById('jsonLink').href = '/results/' + jobId + '.json';
@@ -1113,6 +1176,30 @@ async def download_csv_results(job_id: str):
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "jobs_count": len(JOBS)}
+
+
+@app.post("/cancel/{job_id}")
+async def cancel_job(job_id: str):
+    """Cancel a running job"""
+    if job_id not in JOBS:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = JOBS[job_id]
+    if job['status'] in ['completed', 'failed', 'cancelled']:
+        return {"message": f"Job already {job['status']}", "job_id": job_id}
+    
+    # Mark job as cancelled
+    JOBS[job_id]['status'] = 'cancelled'
+    JOBS[job_id]['end_time'] = datetime.now().isoformat()
+    
+    update_job_db(job_id, {
+        'status': 'cancelled',
+        'end_time': datetime.now()
+    })
+    
+    log_message(job_id, "🛑 Job cancelled by user", "WARN")
+    
+    return {"message": "Job cancelled", "job_id": job_id}
 
 
 @app.get("/favicon.ico")
