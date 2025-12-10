@@ -664,10 +664,11 @@ def run_enrichment_job(job_id: str, companies: list, processor: str, api_key: st
         log_message(job_id, f"💡 TIP: Your partial results have been saved to PostgreSQL. Download them from the results link.")
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
 async def index():
     """Serve the main UI"""
-    return """
+    from fastapi.responses import Response
+    html_content = """
 <!DOCTYPE html>
 <html>
 <head>
@@ -993,6 +994,7 @@ async def index():
 </body>
 </html>
     """
+    return Response(content=html_content, media_type="text/html; charset=utf-8")
 
 
 @app.post("/upload")
