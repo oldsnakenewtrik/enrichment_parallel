@@ -824,7 +824,7 @@ def run_findall_job(
     counties: list,
     processor: str,
     api_key: str,
-    max_concurrent: int = 5
+    max_concurrent: int = 0
 ):
     """Background job to search all counties in parallel"""
 
@@ -833,13 +833,18 @@ def run_findall_job(
         JOBS[job_id]['start_time'] = datetime.now().isoformat()
 
         total_counties = len(counties)
+
+        # 0 means all at once
+        if max_concurrent <= 0:
+            max_concurrent = total_counties
+
         log_message(job_id, "=" * 60)
         log_message(job_id, f"🚀 STARTING FIND ALL JOB")
         log_message(job_id, "=" * 60)
         log_message(job_id, f"🔍 Query: {query}")
         log_message(job_id, f"📍 State: {state}")
         log_message(job_id, f"🗺️  Counties: {total_counties}")
-        log_message(job_id, f"⚡ Concurrent searches: {max_concurrent}")
+        log_message(job_id, f"⚡ Concurrent searches: {max_concurrent}" + (" (ALL)" if max_concurrent == total_counties else ""))
         log_message(job_id, f"⚙️  Processor: {processor}")
         log_message(job_id, f"💰 Estimated cost: ${total_counties * COST_PER_RUN.get(processor, 0.10):.2f}")
         log_message(job_id, "=" * 60)
@@ -1134,10 +1139,12 @@ async def index():
         <div class="form-group">
             <label>Concurrent Searches (how many counties to search at once)</label>
             <select id="findallConcurrent">
-                <option value="3">3 (Conservative)</option>
-                <option value="5" selected>5 (Recommended)</option>
-                <option value="10">10 (Fast)</option>
-                <option value="15">15 (Very Fast)</option>
+                <option value="5">5 at a time</option>
+                <option value="10">10 at a time</option>
+                <option value="20">20 at a time</option>
+                <option value="30">30 at a time</option>
+                <option value="50">50 at a time</option>
+                <option value="0" selected>All at once (67 counties)</option>
             </select>
         </div>
         <div class="form-group">
