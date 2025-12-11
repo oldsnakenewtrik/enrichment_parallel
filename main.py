@@ -27,6 +27,7 @@ import uvicorn
 
 # Parallel API
 from parallel import Parallel
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Database
 import psycopg2
@@ -213,6 +214,43 @@ class JobStatus(BaseModel):
     start_time: Optional[str]
     end_time: Optional[str]
     error: Optional[str]
+
+
+# FindAll schemas
+class FindAllInput(BaseModel):
+    query: str = Field(description="Search query like 'assisted living facilities'")
+    county: str = Field(description="County name")
+    state: str = Field(description="State name")
+
+class FindAllOutput(BaseModel):
+    businesses: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description="List of businesses found with name, address, phone, website, emails"
+    )
+    total_found: Optional[int] = Field(default=None, description="Total number of businesses found")
+    county: Optional[str] = Field(default=None, description="County searched")
+    state: Optional[str] = Field(default=None, description="State searched")
+
+
+# Florida counties (67 total)
+FLORIDA_COUNTIES = [
+    "Alachua", "Baker", "Bay", "Bradford", "Brevard", "Broward", "Calhoun",
+    "Charlotte", "Citrus", "Clay", "Collier", "Columbia", "DeSoto", "Dixie",
+    "Duval", "Escambia", "Flagler", "Franklin", "Gadsden", "Gilchrist",
+    "Glades", "Gulf", "Hamilton", "Hardee", "Hendry", "Hernando", "Highlands",
+    "Hillsborough", "Holmes", "Indian River", "Jackson", "Jefferson", "Lafayette",
+    "Lake", "Lee", "Leon", "Levy", "Liberty", "Madison", "Manatee", "Marion",
+    "Martin", "Miami-Dade", "Monroe", "Nassau", "Okaloosa", "Okeechobee",
+    "Orange", "Osceola", "Palm Beach", "Pasco", "Pinellas", "Polk", "Putnam",
+    "Santa Rosa", "Sarasota", "Seminole", "St. Johns", "St. Lucie", "Sumter",
+    "Suwannee", "Taylor", "Union", "Volusia", "Wakulla", "Walton", "Washington"
+]
+
+# State to counties mapping (expandable)
+STATE_COUNTIES = {
+    "Florida": FLORIDA_COUNTIES,
+    "FL": FLORIDA_COUNTIES,
+}
 
 
 def log_message(job_id: str, message: str, level: str = "INFO"):
@@ -664,6 +702,282 @@ def run_enrichment_job(job_id: str, companies: list, processor: str, api_key: st
         log_message(job_id, f"💡 TIP: Your partial results have been saved to PostgreSQL. Download them from the results link.")
 
 
+def process_single_county_search(
+    client: Parallel,
+    query: str,
+    county: str,
+    state: str,
+    processor: str,
+    job_id: str,
+    county_index: int,
+    total_counties: int
+) -> dict:
+    """Process a single county search with retry logic"""
+
+    # Build the search prompt
+    search_prompt = f"""Find all {query} located in {county} County in the state of {state}, United States.
+All candidates must be located in {county} County, {state}.
+For each business found, provide: name, full address, phone number, website, and any email addresses found."""
+
+    input_data = {
+        "query": query,
+        "county": county,
+        "state": state
+    }
+
+    task_spec = {
+        "input_schema": {
+            "type": "json",
+            "json_schema": FindAllInput.model_json_schema(),
+        },
+        "output_schema": {
+            "type": "json",
+            "json_schema": FindAllOutput.model_json_schema(),
+        },
+        "prompt": search_prompt,
+    }
+
+    progress_prefix = f"[{county_index}/{total_counties}]"
+    max_retries = 3
+
+    for attempt in range(max_retries):
+        try:
+            log_message(job_id, f"{progress_prefix} 🔍 Searching {county} County... (attempt {attempt + 1})")
+
+            task_run = client.task_run.create(
+                input=input_data,
+                task_spec=task_spec,
+                processor=processor
+            )
+
+            log_message(job_id, f"{progress_prefix} API Run ID: {task_run.run_id}")
+
+            # Poll for result
+            start_time = time.time()
+            max_wait = 300  # 5 minutes max per county (searches take longer)
+            poll_count = 0
+
+            while time.time() - start_time < max_wait:
+                try:
+                    poll_count += 1
+                    elapsed = int(time.time() - start_time)
+
+                    result = client.task_run.result(task_run.run_id, api_timeout=30)
+
+                    if result.run.status == "completed":
+                        output = result.output.content if hasattr(result.output, 'content') else {}
+                        businesses = output.get('businesses', []) or []
+                        total_found = len(businesses)
+
+                        log_message(job_id, f"{progress_prefix} ✓ {county} County: Found {total_found} businesses in {elapsed}s")
+
+                        return {
+                            'status': 'success',
+                            'county': county,
+                            'state': state,
+                            'businesses': businesses,
+                            'total_found': total_found,
+                            'run_id': task_run.run_id,
+                            'cost': COST_PER_RUN.get(processor, 0.10),
+                            'elapsed_seconds': elapsed
+                        }
+
+                    elif result.run.status == "failed":
+                        raise Exception(f"Task failed: {result.run}")
+
+                except Exception as e:
+                    if "408" in str(e) or "still active" in str(e).lower():
+                        if poll_count % 6 == 0:
+                            log_message(job_id, f"{progress_prefix} ⏳ {county} County still searching... ({elapsed}s)")
+                        time.sleep(10)
+                    else:
+                        raise
+
+            raise Exception(f"Timeout after {max_wait}s")
+
+        except Exception as e:
+            log_message(job_id, f"{progress_prefix} ⚠ {county} County attempt {attempt + 1} failed: {str(e)}", "WARN")
+
+            if attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 10
+                log_message(job_id, f"{progress_prefix} Retrying {county} County in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                log_message(job_id, f"{progress_prefix} ✗ {county} County FAILED after {max_retries} attempts", "ERROR")
+                return {
+                    'status': 'failed',
+                    'county': county,
+                    'state': state,
+                    'businesses': [],
+                    'total_found': 0,
+                    'error': str(e),
+                    'cost': COST_PER_RUN.get(processor, 0.10)
+                }
+
+    return {'status': 'failed', 'county': county, 'state': state, 'businesses': [], 'total_found': 0}
+
+
+def run_findall_job(
+    job_id: str,
+    query: str,
+    state: str,
+    counties: list,
+    processor: str,
+    api_key: str,
+    max_concurrent: int = 5
+):
+    """Background job to search all counties in parallel"""
+
+    try:
+        JOBS[job_id]['status'] = 'running'
+        JOBS[job_id]['start_time'] = datetime.now().isoformat()
+
+        total_counties = len(counties)
+        log_message(job_id, "=" * 60)
+        log_message(job_id, f"🚀 STARTING FIND ALL JOB")
+        log_message(job_id, "=" * 60)
+        log_message(job_id, f"🔍 Query: {query}")
+        log_message(job_id, f"📍 State: {state}")
+        log_message(job_id, f"🗺️  Counties: {total_counties}")
+        log_message(job_id, f"⚡ Concurrent searches: {max_concurrent}")
+        log_message(job_id, f"⚙️  Processor: {processor}")
+        log_message(job_id, f"💰 Estimated cost: ${total_counties * COST_PER_RUN.get(processor, 0.10):.2f}")
+        log_message(job_id, "=" * 60)
+
+        client = Parallel(api_key=api_key)
+
+        all_results = []
+        all_businesses = []
+        completed_counties = 0
+        failed_counties = 0
+        total_cost = 0.0
+
+        # Process counties in parallel using ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+            # Submit all county searches
+            future_to_county = {}
+            for idx, county in enumerate(counties):
+                future = executor.submit(
+                    process_single_county_search,
+                    client, query, county, state, processor,
+                    job_id, idx + 1, total_counties
+                )
+                future_to_county[future] = county
+
+            # Process results as they complete
+            for future in as_completed(future_to_county):
+                county = future_to_county[future]
+                try:
+                    result = future.result()
+                    all_results.append(result)
+
+                    if result['status'] == 'success':
+                        completed_counties += 1
+                        businesses = result.get('businesses', [])
+                        # Add county info to each business
+                        for biz in businesses:
+                            biz['source_county'] = county
+                            biz['source_state'] = state
+                        all_businesses.extend(businesses)
+                    else:
+                        failed_counties += 1
+
+                    total_cost += result.get('cost', 0)
+
+                    # Update job status
+                    JOBS[job_id]['processed_rows'] = completed_counties + failed_counties
+                    JOBS[job_id]['emails_found'] = len(all_businesses)
+                    JOBS[job_id]['actual_cost'] = total_cost
+                    JOBS[job_id]['success_count'] = completed_counties
+                    JOBS[job_id]['fail_count'] = failed_counties
+
+                    # Save to database
+                    update_job_status_db(job_id, {
+                        'processed_rows': completed_counties + failed_counties,
+                        'emails_found': len(all_businesses),
+                        'actual_cost': total_cost,
+                        'success_count': completed_counties,
+                        'fail_count': failed_counties
+                    })
+
+                    # Log progress
+                    progress = (completed_counties + failed_counties) * 100 // total_counties
+                    log_message(job_id, f"📊 Progress: {completed_counties + failed_counties}/{total_counties} counties ({progress}%) - {len(all_businesses)} businesses found")
+
+                except Exception as e:
+                    log_message(job_id, f"❌ Error processing {county}: {str(e)}", "ERROR")
+                    failed_counties += 1
+
+        # Save final results
+        final_results = {
+            'job_id': job_id,
+            'query': query,
+            'state': state,
+            'total_counties': total_counties,
+            'completed_counties': completed_counties,
+            'failed_counties': failed_counties,
+            'total_businesses': len(all_businesses),
+            'total_cost': total_cost,
+            'businesses': all_businesses,
+            'county_results': all_results
+        }
+
+        # Save to files
+        json_file = RESULTS_DIR / f"{job_id}_findall.json"
+        with open(json_file, 'w') as f:
+            json.dump(final_results, f, indent=2)
+
+        # Save businesses as CSV
+        csv_file = RESULTS_DIR / f"{job_id}_findall.csv"
+        if all_businesses:
+            with open(csv_file, 'w', newline='', encoding='utf-8') as f:
+                # Get all possible fields from businesses
+                all_fields = set()
+                for biz in all_businesses:
+                    all_fields.update(biz.keys())
+                fieldnames = sorted(list(all_fields))
+
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(all_businesses)
+
+        JOBS[job_id]['status'] = 'completed'
+        JOBS[job_id]['end_time'] = datetime.now().isoformat()
+
+        update_job_status_db(job_id, {
+            'status': 'completed',
+            'end_time': datetime.now()
+        })
+
+        elapsed = (datetime.fromisoformat(JOBS[job_id]['end_time']) -
+                   datetime.fromisoformat(JOBS[job_id]['start_time'])).total_seconds()
+
+        log_message(job_id, "")
+        log_message(job_id, "=" * 60)
+        log_message(job_id, f"🎉 FIND ALL JOB COMPLETED!")
+        log_message(job_id, "=" * 60)
+        log_message(job_id, f"🗺️  Counties searched: {total_counties}")
+        log_message(job_id, f"✅ Successful: {completed_counties}")
+        log_message(job_id, f"❌ Failed: {failed_counties}")
+        log_message(job_id, f"🏢 Total businesses found: {len(all_businesses)}")
+        log_message(job_id, f"💰 Total cost: ${total_cost:.2f}")
+        log_message(job_id, f"⏱️  Total time: {int(elapsed//60)}m {int(elapsed%60)}s")
+        log_message(job_id, "=" * 60)
+
+    except Exception as e:
+        JOBS[job_id]['status'] = 'failed'
+        JOBS[job_id]['error'] = str(e)
+        JOBS[job_id]['end_time'] = datetime.now().isoformat()
+
+        update_job_status_db(job_id, {
+            'status': 'failed',
+            'error': str(e),
+            'end_time': datetime.now()
+        })
+
+        log_message(job_id, f"❌ JOB FAILED: {str(e)}", "ERROR")
+
+
 @app.get("/")
 async def index():
     """Serve the main UI"""
@@ -754,12 +1068,33 @@ async def index():
             margin-bottom: 15px;
         }
         a { color: #007bff; }
+        .tabs { display: flex; margin-bottom: 0; }
+        .tab {
+            padding: 12px 24px;
+            background: #e9ecef;
+            border: none;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            border-radius: 8px 8px 0 0;
+            margin-right: 4px;
+        }
+        .tab.active { background: white; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        .card.tab-card { border-radius: 0 8px 8px 8px; margin-top: 0; }
     </style>
 </head>
 <body>
     <h1>Email Enrichment Tool</h1>
-    
-    <div class="card">
+
+    <div class="tabs">
+        <button class="tab active" onclick="showTab('csv')">CSV Upload</button>
+        <button class="tab" onclick="showTab('findall')">Find All by County</button>
+    </div>
+
+    <div class="card tab-card">
+        <div id="csvTab" class="tab-content active">
         <h2>Upload CSV</h2>
         <div class="form-group">
             <label>CSV File (with columns: company_name, address, city, state, zip, type, number, phone)</label>
@@ -781,6 +1116,47 @@ async def index():
             <br><small>For <span id="rowCount">0</span> companies</small>
         </div>
         <button onclick="startEnrichment()" id="startBtn">Start Enrichment</button>
+        </div>
+
+        <div id="findallTab" class="tab-content">
+        <h2>Find All by County</h2>
+        <p style="color: #666; margin-bottom: 15px;">Search for all businesses matching your query across all counties in a state. Searches run in parallel.</p>
+        <div class="form-group">
+            <label>Search Query (e.g., "assisted living facilities")</label>
+            <input type="text" id="findallQuery" placeholder="assisted living facilities">
+        </div>
+        <div class="form-group">
+            <label>State</label>
+            <select id="findallState">
+                <option value="Florida">Florida (67 counties)</option>
+            </select>
+        </div>
+        <div class="form-group">
+            <label>Concurrent Searches (how many counties to search at once)</label>
+            <select id="findallConcurrent">
+                <option value="3">3 (Conservative)</option>
+                <option value="5" selected>5 (Recommended)</option>
+                <option value="10">10 (Fast)</option>
+                <option value="15">15 (Very Fast)</option>
+            </select>
+        </div>
+        <div class="form-group">
+            <label>Processor</label>
+            <select id="findallProcessor">
+                <option value="base">Base ($0.02/county) - Fast, basic research</option>
+                <option value="core" selected>Core ($0.10/county) - Deep research, more sources</option>
+            </select>
+        </div>
+        <div class="form-group">
+            <label>Parallel API Key</label>
+            <input type="password" id="findallApiKey" placeholder="Your Parallel API key">
+        </div>
+        <div class="cost-estimate" id="findallCostEstimate">
+            <strong>Estimated Cost:</strong> <span id="findallEstimatedCost">$6.70</span>
+            <br><small>For <span id="findallCountyCount">67</span> counties in Florida</small>
+        </div>
+        <button onclick="startFindAll()" id="findallStartBtn">Start Find All Search</button>
+        </div>
     </div>
     
     <div class="card" id="statusCard" style="display:none;">
@@ -833,7 +1209,77 @@ async def index():
     <script>
         let eventSource = null;
         let currentJobId = null;
-        
+        let currentJobType = 'csv';  // 'csv' or 'findall'
+
+        function showTab(tab) {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+            if (tab === 'csv') {
+                document.querySelector('.tab:nth-child(1)').classList.add('active');
+                document.getElementById('csvTab').classList.add('active');
+            } else {
+                document.querySelector('.tab:nth-child(2)').classList.add('active');
+                document.getElementById('findallTab').classList.add('active');
+            }
+        }
+
+        // Update findall cost estimate when processor changes
+        document.getElementById('findallProcessor').addEventListener('change', function() {
+            const cost = this.value === 'core' ? 0.10 : 0.02;
+            const counties = 67;  // Florida
+            document.getElementById('findallEstimatedCost').textContent = '$' + (counties * cost).toFixed(2);
+        });
+
+        async function startFindAll() {
+            const query = document.getElementById('findallQuery').value;
+            const state = document.getElementById('findallState').value;
+            const processor = document.getElementById('findallProcessor').value;
+            const apiKey = document.getElementById('findallApiKey').value;
+            const concurrent = document.getElementById('findallConcurrent').value;
+
+            if (!query) {
+                alert('Please enter a search query');
+                return;
+            }
+            if (!apiKey) {
+                alert('Please enter your Parallel API key');
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append('query', query);
+            formData.append('state', state);
+            formData.append('processor', processor);
+            formData.append('api_key', apiKey);
+            formData.append('max_concurrent', concurrent);
+
+            document.getElementById('findallStartBtn').disabled = true;
+            document.getElementById('statusCard').style.display = 'block';
+            document.getElementById('logs').innerHTML = '';
+            currentJobType = 'findall';
+
+            try {
+                const response = await fetch('/findall', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const data = await response.json();
+
+                if (response.ok && data.job_id) {
+                    currentJobId = data.job_id;
+                    connectToLogs(data.job_id);
+                    pollStatus(data.job_id);
+                } else {
+                    alert('Error: ' + (data.detail || data.error || JSON.stringify(data)));
+                    document.getElementById('findallStartBtn').disabled = false;
+                }
+            } catch (e) {
+                alert('Error: ' + e.message);
+                document.getElementById('findallStartBtn').disabled = false;
+            }
+        }
+
         document.getElementById('csvFile').addEventListener('change', function(e) {
             const file = e.target.files[0];
             if (file) {
@@ -880,7 +1326,8 @@ async def index():
             document.getElementById('startBtn').disabled = true;
             document.getElementById('statusCard').style.display = 'block';
             document.getElementById('logs').innerHTML = '';
-            
+            currentJobType = 'csv';
+
             try {
                 const response = await fetch('/upload', {
                     method: 'POST',
@@ -957,12 +1404,18 @@ async def index():
                         document.getElementById('statETA').textContent = 'Failed';
                     }
                     
-                    // Show download links after first save (5 companies) or on completion/failure
+                    // Show download links after first save (5 items) or on completion/failure
                     if (status.processed_rows >= 5 || status.status === 'completed' || status.status === 'failed') {
                         document.getElementById('downloadLinks').style.display = 'block';
-                        document.getElementById('jsonLink').href = '/results/' + jobId + '.json';
-                        document.getElementById('csvLink').href = '/results/' + jobId + '.csv';
-                        
+                        // Use different URLs for findall vs csv jobs
+                        if (currentJobType === 'findall') {
+                            document.getElementById('jsonLink').href = '/findall/results/' + jobId + '.json';
+                            document.getElementById('csvLink').href = '/findall/results/' + jobId + '.csv';
+                        } else {
+                            document.getElementById('jsonLink').href = '/results/' + jobId + '.json';
+                            document.getElementById('csvLink').href = '/results/' + jobId + '.csv';
+                        }
+
                         if (status.status === 'running') {
                             document.getElementById('partialWarning').textContent = '[!] Partial results (job still running)';
                             document.getElementById('downloadLinks').style.background = '#fff3cd';
@@ -974,9 +1427,14 @@ async def index():
                             document.getElementById('downloadLinks').style.background = '#e8f5e9';
                         }
                     }
-                    
+
                     if (status.status === 'completed' || status.status === 'failed') {
-                        document.getElementById('startBtn').disabled = false;
+                        // Re-enable the appropriate button
+                        if (currentJobType === 'findall') {
+                            document.getElementById('findallStartBtn').disabled = false;
+                        } else {
+                            document.getElementById('startBtn').disabled = false;
+                        }
                         if (eventSource) eventSource.close();
                         pollStartTime = null;
                     } else {
@@ -1131,6 +1589,119 @@ async def upload_csv(
     thread.start()
     
     return {"job_id": job_id, "total_rows": len(companies), "estimated_cost": estimated_cost}
+
+
+@app.post("/findall")
+async def start_findall(
+    query: str = Form(...),
+    state: str = Form(...),
+    processor: str = Form("core"),
+    api_key: str = Form(...),
+    max_concurrent: int = Form(5)
+):
+    """Start a Find All job to search all counties in a state"""
+
+    # Get counties for the state
+    counties = STATE_COUNTIES.get(state) or STATE_COUNTIES.get(state.upper())
+    if not counties:
+        raise HTTPException(
+            status_code=400,
+            detail=f"State '{state}' not supported. Currently supported: {list(STATE_COUNTIES.keys())}"
+        )
+
+    # Generate job ID
+    job_id = str(uuid.uuid4())
+
+    # Initialize job
+    estimated_cost = len(counties) * COST_PER_RUN.get(processor, 0.10)
+
+    job_data = {
+        'job_id': job_id,
+        'status': 'pending',
+        'total_rows': len(counties),
+        'processed_rows': 0,
+        'emails_found': 0,  # Will track total businesses found
+        'estimated_cost': estimated_cost,
+        'actual_cost': 0.0,
+        'start_time': None,
+        'end_time': None,
+        'error': None,
+        'success_count': 0,
+        'no_email_count': 0,
+        'fail_count': 0,
+        'processor': processor,
+        'job_type': 'findall',
+        'query': query,
+        'state': state
+    }
+
+    JOBS[job_id] = job_data
+
+    # Save job to database
+    create_job_db(job_id, job_data)
+
+    # Initialize log queue
+    LOG_QUEUES[job_id] = Queue()
+
+    # Start background job
+    thread = threading.Thread(
+        target=run_findall_job,
+        args=(job_id, query, state, counties, processor, api_key, max_concurrent)
+    )
+    thread.daemon = True
+    thread.start()
+
+    return {
+        "job_id": job_id,
+        "total_counties": len(counties),
+        "estimated_cost": estimated_cost,
+        "counties": counties
+    }
+
+
+@app.get("/findall/results/{job_id}.json")
+async def download_findall_json(job_id: str):
+    """Download Find All results as JSON"""
+    json_file = RESULTS_DIR / f"{job_id}_findall.json"
+    if not json_file.exists():
+        raise HTTPException(status_code=404, detail="Results not found yet. Processing may still be in progress.")
+
+    with open(json_file, 'r') as f:
+        results = json.load(f)
+
+    return JSONResponse(content=results)
+
+
+@app.get("/findall/results/{job_id}.csv")
+async def download_findall_csv(job_id: str):
+    """Download Find All results as CSV"""
+    csv_file = RESULTS_DIR / f"{job_id}_findall.csv"
+    if not csv_file.exists():
+        raise HTTPException(status_code=404, detail="Results not found yet. Processing may still be in progress.")
+
+    with open(csv_file, 'r') as f:
+        content = f.read()
+
+    job_info = JOBS.get(job_id) or {}
+    status_suffix = "_partial" if job_info.get('status') == 'running' else ""
+
+    return StreamingResponse(
+        iter([content]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=findall_results_{job_id[:8]}{status_suffix}.csv"}
+    )
+
+
+@app.get("/counties/{state}")
+async def get_counties(state: str):
+    """Get list of counties for a state"""
+    counties = STATE_COUNTIES.get(state) or STATE_COUNTIES.get(state.upper())
+    if not counties:
+        raise HTTPException(
+            status_code=404,
+            detail=f"State '{state}' not supported. Currently supported: {list(STATE_COUNTIES.keys())}"
+        )
+    return {"state": state, "counties": counties, "total": len(counties)}
 
 
 @app.get("/status/{job_id}")
