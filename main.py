@@ -723,6 +723,7 @@ def process_county_search(
     state: str,
     country: str,
     business_type: str,
+    prompt_template: str,
     task_spec: dict,
     processor: str,
     max_retries: int = 3,
@@ -745,21 +746,8 @@ def process_county_search(
         try:
             log_message(job_id, f"{progress_prefix} Attempt {attempt + 1}/{max_retries} for: {county} County, {state}")
 
-            # Create task run with explicit prompt
-            prompt = f"""Find all {business_type} in {county} County, {state}, {country}.
-
-Search thoroughly for businesses that:
-1. Are located specifically in {county} County, {state}, {country}
-2. Match the business type: {business_type}
-
-For each business found, provide:
-- Business name
-- Full address
-- Phone number
-- Website URL
-- Email address (if available)
-
-Only include businesses that are actually located in {county} County."""
+            # Build prompt from template by replacing placeholders
+            prompt = prompt_template.replace('{county}', county).replace('{state}', state).replace('{country}', country).replace('{business_type}', business_type)
 
             task_run = client.task_run.create(
                 input=input_data,
@@ -841,6 +829,7 @@ def run_findall_county_job(
     job_id: str,
     counties: list,
     business_type: str,
+    prompt_template: str,
     processor: str,
     api_key: str,
     max_concurrent: int = 5
@@ -897,6 +886,7 @@ def run_findall_county_job(
                     state=county_data['state'],
                     country=county_data.get('country', 'USA'),
                     business_type=business_type,
+                    prompt_template=prompt_template,
                     task_spec=task_spec,
                     processor=processor,
                     max_retries=3,
@@ -1710,7 +1700,19 @@ async def findall_page():
         </div>
         <div class="form-group">
             <label>Business Type to Search For</label>
-            <input type="text" id="businessType" value="assisted living facilities" placeholder="e.g., assisted living facilities, restaurants, law firms">
+            <input type="text" id="businessType" value="assisted living facilities" placeholder="e.g., assisted living facilities, restaurants, law firms" oninput="updatePromptPreview()">
+        </div>
+        <div class="form-group">
+            <label>Search Prompt Template <small style="color:#666;">(use {county}, {state}, {country}, {business_type} as placeholders)</small></label>
+            <textarea id="promptTemplate" rows="6" style="font-family: monospace; font-size: 13px;">Find all {business_type} in {county} County, {state}, {country}.
+
+They must be located specifically in {county} County, {state}, {country} to be a valid candidate.
+
+For each business found, provide: name, full address, phone number, website URL, and email address if available.</textarea>
+        </div>
+        <div class="form-group">
+            <label>Prompt Preview <small style="color:#666;">(example with first county)</small></label>
+            <div id="promptPreview" style="background: #f8f9fa; border: 1px solid #ddd; padding: 10px; border-radius: 4px; font-family: monospace; font-size: 12px; white-space: pre-wrap; color: #333;"></div>
         </div>
         <div class="form-group">
             <label>Processor</label>
@@ -1789,6 +1791,26 @@ async def findall_page():
         let currentJobId = null;
 
         const COSTS = { base: 0.02, core: 0.10 };
+        let firstCounty = { county: 'Alachua', state: 'FL', country: 'USA' };  // Default for preview
+
+        function updatePromptPreview() {
+            const template = document.getElementById('promptTemplate').value;
+            const businessType = document.getElementById('businessType').value || 'assisted living facilities';
+
+            let preview = template
+                .replace(/\{county\}/g, firstCounty.county)
+                .replace(/\{state\}/g, firstCounty.state)
+                .replace(/\{country\}/g, firstCounty.country)
+                .replace(/\{business_type\}/g, businessType);
+
+            document.getElementById('promptPreview').textContent = preview;
+        }
+
+        // Update preview when template changes
+        document.getElementById('promptTemplate').addEventListener('input', updatePromptPreview);
+
+        // Initial preview
+        setTimeout(updatePromptPreview, 100);
 
         document.getElementById('csvFile').addEventListener('change', function(e) {
             const file = e.target.files[0];
@@ -1804,6 +1826,23 @@ async def findall_page():
                     document.getElementById('countyCount').textContent = countyCount;
                     document.getElementById('estimatedCost').textContent = '$' + (countyCount * cost).toFixed(2);
                     document.getElementById('costEstimate').style.display = 'block';
+
+                    // Parse first data row for preview
+                    if (lines.length >= 2) {
+                        const header = lines[0].toLowerCase();
+                        const firstRow = lines[1].split(',');
+                        const headers = lines[0].split(',').map(h => h.toLowerCase().trim());
+
+                        const countyIdx = headers.findIndex(h => h.includes('county'));
+                        const stateIdx = headers.findIndex(h => h.includes('state'));
+                        const countryIdx = headers.findIndex(h => h.includes('country'));
+
+                        if (countyIdx >= 0) firstCounty.county = firstRow[countyIdx]?.trim() || 'Alachua';
+                        if (stateIdx >= 0) firstCounty.state = firstRow[stateIdx]?.trim() || 'FL';
+                        if (countryIdx >= 0) firstCounty.country = firstRow[countryIdx]?.trim() || 'USA';
+
+                        updatePromptPreview();
+                    }
                 };
                 reader.readAsText(file);
             }
@@ -1818,6 +1857,7 @@ async def findall_page():
         async function startFindAll() {
             const fileInput = document.getElementById('csvFile');
             const businessType = document.getElementById('businessType').value.trim();
+            const promptTemplate = document.getElementById('promptTemplate').value.trim();
             const processor = document.getElementById('processor').value;
             const maxConcurrent = document.getElementById('maxConcurrent').value;
             const apiKey = document.getElementById('apiKey').value;
@@ -1830,6 +1870,10 @@ async def findall_page():
                 alert('Please enter a business type to search for');
                 return;
             }
+            if (!promptTemplate) {
+                alert('Please enter a search prompt template');
+                return;
+            }
             if (!apiKey) {
                 alert('Please enter your Parallel API key');
                 return;
@@ -1838,6 +1882,7 @@ async def findall_page():
             const formData = new FormData();
             formData.append('file', fileInput.files[0]);
             formData.append('business_type', businessType);
+            formData.append('prompt_template', promptTemplate);
             formData.append('processor', processor);
             formData.append('max_concurrent', maxConcurrent);
             formData.append('api_key', apiKey);
@@ -1960,6 +2005,7 @@ async def findall_page():
 async def upload_counties_csv(
     file: UploadFile = File(...),
     business_type: str = Form("assisted living facilities"),
+    prompt_template: str = Form("Find all {business_type} in {county} County, {state}, {country}. They must be located specifically in {county} County to be valid."),
     processor: str = Form("core"),
     max_concurrent: int = Form(5),
     api_key: str = Form(...)
@@ -2034,7 +2080,7 @@ async def upload_counties_csv(
     # Start background job
     thread = threading.Thread(
         target=run_findall_county_job,
-        args=(job_id, counties, business_type, processor, api_key, max_concurrent)
+        args=(job_id, counties, business_type, prompt_template, processor, api_key, max_concurrent)
     )
     thread.daemon = True
     thread.start()
