@@ -758,7 +758,10 @@ async def index():
 </head>
 <body>
     <h1>Email Enrichment Tool</h1>
-    
+    <div style="background: #d4edda; border: 1px solid #28a745; padding: 8px 15px; border-radius: 4px; margin-bottom: 15px; font-size: 12px; color: #155724;">
+        <strong>Version:</strong> fix-business-schema-indicators | <strong>Schema:</strong> DeepEmailOutput (4 email fields + website + sources)
+    </div>
+
     <div class="card">
         <h2>Upload CSV</h2>
         <div class="form-group">
