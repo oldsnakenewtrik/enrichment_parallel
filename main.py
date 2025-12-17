@@ -744,7 +744,7 @@ def process_county_search(
 
     for attempt in range(max_retries):
         try:
-            log_message(job_id, f"{progress_prefix} Attempt {attempt + 1}/{max_retries} for: {county} County, {state}")
+            log_message(job_id, f"{progress_prefix} Attempt {attempt + 1}/{max_retries} for: {county} County, {state} - '{business_type}'")
 
             # Build prompt from template by replacing placeholders
             prompt = prompt_template.replace('{county}', county).replace('{state}', state).replace('{country}', country).replace('{business_type}', business_type)
@@ -784,6 +784,7 @@ def process_county_search(
                             'status': 'success',
                             'county': county,
                             'state': state,
+                            'business_type': business_type,
                             'businesses': businesses,
                             'total_found': total_found,
                             'run_id': task_run.run_id,
@@ -811,44 +812,53 @@ def process_county_search(
                 log_message(job_id, f"{progress_prefix} Retrying in {wait_time}s...")
                 time.sleep(wait_time)
             else:
-                log_message(job_id, f"{progress_prefix} ✗ FAILED: All {max_retries} retries exhausted for {county} County", "ERROR")
+                log_message(job_id, f"{progress_prefix} ✗ FAILED: All {max_retries} retries exhausted for {county} County - '{business_type}'", "ERROR")
                 return {
                     'status': 'failed',
                     'county': county,
                     'state': state,
+                    'business_type': business_type,
                     'businesses': [],
                     'total_found': 0,
                     'error': str(e),
                     'cost': COST_PER_RUN.get(processor, 0.10)
                 }
 
-    return {'status': 'failed', 'county': county, 'state': state, 'businesses': [], 'total_found': 0, 'cost': 0}
+    return {'status': 'failed', 'county': county, 'state': state, 'business_type': business_type, 'businesses': [], 'total_found': 0, 'cost': 0}
 
 
 def run_findall_county_job(
     job_id: str,
     counties: list,
-    business_type: str,
+    business_types: list,
     prompt_template: str,
     processor: str,
     api_key: str,
     max_concurrent: int = 5
 ):
-    """Background job to search all counties in parallel"""
+    """Background job to search all counties with all keyword variants in parallel"""
 
     try:
         JOBS[job_id]['status'] = 'running'
         JOBS[job_id]['start_time'] = datetime.now().isoformat()
 
-        total = len(counties)
+        num_counties = len(counties)
+        num_keywords = len(business_types)
+        total = num_counties * num_keywords  # Total searches = counties × keywords
+        
         log_message(job_id, "=" * 60)
-        log_message(job_id, f"🚀 STARTING FIND ALL BY COUNTY")
+        log_message(job_id, f"🚀 STARTING FIND ALL BY COUNTY (MULTI-KEYWORD)")
         log_message(job_id, "=" * 60)
-        log_message(job_id, f"🏢 Business type: {business_type}")
-        log_message(job_id, f"🗺️  Total counties: {total}")
+        log_message(job_id, f"🗺️  Counties: {num_counties}")
+        log_message(job_id, f"🔑 Keywords: {num_keywords}")
+        log_message(job_id, f"📊 Total searches: {total} ({num_counties} counties × {num_keywords} keywords)")
         log_message(job_id, f"⚙️  Processor: {processor}")
         log_message(job_id, f"🔀 Max concurrent: {max_concurrent}")
         log_message(job_id, f"💰 Estimated cost: ${total * COST_PER_RUN.get(processor, 0.10):.2f}")
+        log_message(job_id, "=" * 60)
+        log_message(job_id, "Keywords to search:")
+        for i, kw in enumerate(business_types, 1):
+            log_message(job_id, f"  {i}. {kw}")
         log_message(job_id, "=" * 60)
 
         client = Parallel(api_key=api_key)
@@ -874,31 +884,45 @@ def run_findall_county_job(
         success_count = 0
         fail_count = 0
 
-        # Process counties with thread pool for parallel execution
+        # Build list of all (county, keyword) combinations
+        search_tasks = []
+        task_idx = 0
+        for county_data in counties:
+            for business_type in business_types:
+                task_idx += 1
+                search_tasks.append({
+                    'idx': task_idx,
+                    'county': county_data['county'],
+                    'state': county_data['state'],
+                    'country': county_data.get('country', 'USA'),
+                    'business_type': business_type
+                })
+
+        # Process all county+keyword combinations with thread pool
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent) as executor:
-            # Submit all county searches
-            future_to_county = {}
-            for idx, county_data in enumerate(counties):
+            # Submit all searches
+            future_to_task = {}
+            for task in search_tasks:
                 future = executor.submit(
                     process_county_search,
                     client=client,
-                    county=county_data['county'],
-                    state=county_data['state'],
-                    country=county_data.get('country', 'USA'),
-                    business_type=business_type,
+                    county=task['county'],
+                    state=task['state'],
+                    country=task['country'],
+                    business_type=task['business_type'],
                     prompt_template=prompt_template,
                     task_spec=task_spec,
                     processor=processor,
                     max_retries=3,
                     job_id=job_id,
-                    county_index=idx + 1,
+                    county_index=task['idx'],
                     total_counties=total
                 )
-                future_to_county[future] = county_data
+                future_to_task[future] = task
 
             # Collect results as they complete
-            for future in concurrent.futures.as_completed(future_to_county):
-                county_data = future_to_county[future]
+            for future in concurrent.futures.as_completed(future_to_task):
+                task = future_to_task[future]
                 try:
                     result = future.result()
                     all_results.append(result)
@@ -906,10 +930,11 @@ def run_findall_county_job(
                     if result['status'] == 'success':
                         success_count += 1
                         businesses = result.get('businesses', [])
-                        # Add county/state to each business for context
+                        # Add county/state/keyword to each business for context
                         for biz in businesses:
                             biz['search_county'] = result['county']
                             biz['search_state'] = result['state']
+                            biz['search_keyword'] = result.get('business_type', task['business_type'])
                         all_businesses.extend(businesses)
                     else:
                         fail_count += 1
@@ -924,10 +949,10 @@ def run_findall_county_job(
                     JOBS[job_id]['success_count'] = success_count
                     JOBS[job_id]['fail_count'] = fail_count
 
-                    log_message(job_id, f"📊 Progress: {processed}/{total} counties ({processed*100//total}%) - {len(all_businesses)} businesses found")
+                    log_message(job_id, f"📊 Progress: {processed}/{total} searches ({processed*100//total}%) - {len(all_businesses)} businesses found")
 
                 except Exception as exc:
-                    log_message(job_id, f"❌ County {county_data['county']} generated exception: {exc}", "ERROR")
+                    log_message(job_id, f"❌ {task['county']}, {task['state']} - '{task['business_type']}' generated exception: {exc}", "ERROR")
                     fail_count += 1
 
         # Save results
@@ -938,20 +963,22 @@ def run_findall_county_job(
         with open(json_file, 'w') as f:
             json.dump({
                 "job_id": job_id,
-                "business_type": business_type,
-                "total_counties": total,
-                "successful_counties": success_count,
-                "failed_counties": fail_count,
+                "keywords": business_types,
+                "total_counties": num_counties,
+                "total_keywords": num_keywords,
+                "total_searches": total,
+                "successful_searches": success_count,
+                "failed_searches": fail_count,
                 "total_businesses": len(all_businesses),
                 "total_cost": total_cost,
-                "county_results": all_results,
+                "search_results": all_results,
                 "businesses": all_businesses
             }, f, indent=2)
 
         # Save CSV of all businesses
         if all_businesses:
             with open(csv_file, 'w', newline='', encoding='utf-8') as f:
-                fieldnames = ['name', 'address', 'city', 'state', 'zip_code', 'phone', 'website', 'email', 'search_county', 'search_state']
+                fieldnames = ['name', 'address', 'city', 'state', 'zip_code', 'phone', 'website', 'email', 'search_county', 'search_state', 'search_keyword']
                 writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
                 writer.writeheader()
                 writer.writerows(all_businesses)
@@ -967,7 +994,9 @@ def run_findall_county_job(
         log_message(job_id, "=" * 60)
         log_message(job_id, f"🎉 FIND ALL JOB COMPLETED!")
         log_message(job_id, "=" * 60)
-        log_message(job_id, f"🗺️ Counties searched: {total}")
+        log_message(job_id, f"🗺️ Counties: {num_counties}")
+        log_message(job_id, f"🔑 Keywords: {num_keywords}")
+        log_message(job_id, f"📊 Total searches: {total}")
         log_message(job_id, f"✅ Successful: {success_count}")
         log_message(job_id, f"❌ Failed: {fail_count}")
         log_message(job_id, f"🏢 Total businesses found: {len(all_businesses)}")
@@ -1584,7 +1613,7 @@ async def findall_page():
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Find All by County</title>
+    <title>Find All by County (Multi-Keyword)</title>
     <style>
         * { box-sizing: border-box; }
         body {
@@ -1674,34 +1703,78 @@ async def findall_page():
             border-radius: 4px;
             margin-bottom: 15px;
         }
+        .keyword-box {
+            background: #f3e5f5;
+            border: 1px solid #9c27b0;
+            padding: 15px;
+            border-radius: 4px;
+            margin-bottom: 15px;
+        }
         a { color: #007bff; }
         .nav { margin-bottom: 20px; }
         .nav a { margin-right: 15px; }
+        .two-col {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+        @media (max-width: 768px) {
+            .two-col { grid-template-columns: 1fr; }
+        }
     </style>
 </head>
 <body>
     <div class="nav">
         <a href="/">Email Enrichment</a> |
-        <a href="/findall"><strong>Find All by County</strong></a>
+        <a href="/findall"><strong>Find All by County (Multi-Keyword)</strong></a>
     </div>
 
-    <h1>Find All by County</h1>
-    <p class="subtitle">Upload a CSV of counties to search for businesses in parallel</p>
+    <h1>Find All by County (Multi-Keyword)</h1>
+    <p class="subtitle">Upload a CSV of counties and a list of keyword variants to search in parallel</p>
 
     <div class="card">
-        <h2>Upload Counties CSV</h2>
-        <div class="info-box">
-            <strong>CSV Format:</strong> Your CSV should have columns: <code>county</code>, <code>state</code>, and optionally <code>country</code><br>
-            <small>Example row: Alachua, FL, USA</small>
+        <h2>Configuration</h2>
+        
+        <div class="two-col">
+            <div>
+                <div class="info-box">
+                    <strong>📍 Counties CSV Format:</strong><br>
+                    Your CSV should have columns: <code>county</code>, <code>state</code>, and optionally <code>country</code><br>
+                    <small>Example row: Alachua, FL, USA</small>
+                </div>
+                <div class="form-group">
+                    <label>Counties CSV File</label>
+                    <input type="file" id="csvFile" accept=".csv">
+                </div>
+            </div>
+            
+            <div>
+                <div class="keyword-box">
+                    <strong>🔑 Keyword Variants:</strong><br>
+                    Enter one keyword per line. Each keyword will be searched in each county.<br>
+                    <small>Example: "assisted living facilities", "senior living", etc.</small>
+                </div>
+                <div class="form-group">
+                    <label>Keywords (one per line)</label>
+                    <textarea id="keywords" rows="10" style="font-family: monospace; font-size: 13px;" oninput="updateCostEstimate()">assisted living facilities
+senior living
+senior community
+assisted living community
+residential assisted living
+senior care home
+board and care homes
+residential care home
+retirement community
+retirement homes
+senior living community
+senior housing
+residential care homes
+adult care home
+group home for seniors</textarea>
+                </div>
+            </div>
         </div>
-        <div class="form-group">
-            <label>Counties CSV File</label>
-            <input type="file" id="csvFile" accept=".csv">
-        </div>
-        <div class="form-group">
-            <label>Business Type to Search For</label>
-            <input type="text" id="businessType" value="assisted living facilities" placeholder="e.g., assisted living facilities, restaurants, law firms" oninput="updatePromptPreview()">
-        </div>
+        
         <div class="form-group">
             <label>Search Prompt Template <small style="color:#666;">(use {county}, {state}, {country}, {business_type} as placeholders)</small></label>
             <textarea id="promptTemplate" rows="6" style="font-family: monospace; font-size: 13px;">Find all {business_type} in {county} County, {state}, {country}.
@@ -1711,14 +1784,14 @@ They must be located specifically in {county} County, {state}, {country} to be a
 For each business found, provide: name, full address, phone number, website URL, and email address if available.</textarea>
         </div>
         <div class="form-group">
-            <label>Prompt Preview <small style="color:#666;">(example with first county)</small></label>
+            <label>Prompt Preview <small style="color:#666;">(example with first county and first keyword)</small></label>
             <div id="promptPreview" style="background: #f8f9fa; border: 1px solid #ddd; padding: 10px; border-radius: 4px; font-family: monospace; font-size: 12px; white-space: pre-wrap; color: #333;"></div>
         </div>
         <div class="form-group">
             <label>Processor</label>
-            <select id="processor">
-                <option value="base">Base ($0.02/county) - Fast, basic search</option>
-                <option value="core" selected>Core ($0.10/county) - Thorough search</option>
+            <select id="processor" onchange="updateCostEstimate()">
+                <option value="base">Base ($0.02/search) - Fast, basic search</option>
+                <option value="core" selected>Core ($0.10/search) - Thorough search</option>
             </select>
         </div>
         <div class="form-group">
@@ -1734,10 +1807,11 @@ For each business found, provide: name, full address, phone number, website URL,
             <input type="password" id="apiKey" placeholder="Your Parallel API key">
         </div>
         <div class="cost-estimate" id="costEstimate" style="display:none;">
-            <strong>Estimated Cost:</strong> <span id="estimatedCost">$0.00</span>
-            <br><small>For <span id="countyCount">0</span> counties</small>
+            <strong>📊 Estimated:</strong><br>
+            <span id="countyCount">0</span> counties × <span id="keywordCount">0</span> keywords = <strong><span id="totalSearches">0</span> searches</strong><br>
+            <strong>💰 Cost:</strong> <span id="estimatedCost">$0.00</span>
         </div>
-        <button onclick="startFindAll()" id="startBtn">Start Find All</button>
+        <button onclick="startFindAll()" id="startBtn">Start Find All (Multi-Keyword)</button>
     </div>
 
     <div class="card" id="statusCard" style="display:none;">
@@ -1789,19 +1863,45 @@ For each business found, provide: name, full address, phone number, website URL,
     <script>
         let eventSource = null;
         let currentJobId = null;
+        let countyCount = 0;
 
         const COSTS = { base: 0.02, core: 0.10 };
         let firstCounty = { county: 'Alachua', state: 'FL', country: 'USA' };  // Default for preview
 
+        function getKeywords() {
+            const text = document.getElementById('keywords').value;
+            return text.split('\\n').map(k => k.trim()).filter(k => k.length > 0);
+        }
+
+        function updateCostEstimate() {
+            const keywords = getKeywords();
+            const keywordCount = keywords.length;
+            const processor = document.getElementById('processor').value;
+            const cost = COSTS[processor] || 0.10;
+            const totalSearches = countyCount * keywordCount;
+
+            document.getElementById('countyCount').textContent = countyCount;
+            document.getElementById('keywordCount').textContent = keywordCount;
+            document.getElementById('totalSearches').textContent = totalSearches;
+            document.getElementById('estimatedCost').textContent = '$' + (totalSearches * cost).toFixed(2);
+            
+            if (countyCount > 0 && keywordCount > 0) {
+                document.getElementById('costEstimate').style.display = 'block';
+            }
+            
+            updatePromptPreview();
+        }
+
         function updatePromptPreview() {
             const template = document.getElementById('promptTemplate').value;
-            const businessType = document.getElementById('businessType').value || 'assisted living facilities';
+            const keywords = getKeywords();
+            const firstKeyword = keywords.length > 0 ? keywords[0] : 'assisted living facilities';
 
             let preview = template
                 .replace(/\{county\}/g, firstCounty.county)
                 .replace(/\{state\}/g, firstCounty.state)
                 .replace(/\{country\}/g, firstCounty.country)
-                .replace(/\{business_type\}/g, businessType);
+                .replace(/\{business_type\}/g, firstKeyword);
 
             document.getElementById('promptPreview').textContent = preview;
         }
@@ -1810,7 +1910,7 @@ For each business found, provide: name, full address, phone number, website URL,
         document.getElementById('promptTemplate').addEventListener('input', updatePromptPreview);
 
         // Initial preview
-        setTimeout(updatePromptPreview, 100);
+        setTimeout(updateCostEstimate, 100);
 
         document.getElementById('csvFile').addEventListener('change', function(e) {
             const file = e.target.files[0];
@@ -1819,13 +1919,7 @@ For each business found, provide: name, full address, phone number, website URL,
                 reader.onload = function(e) {
                     const lines = e.target.result.split('\\n').filter(l => l.trim());
                     // Subtract 1 for header row
-                    const countyCount = Math.max(0, lines.length - 1);
-                    const processor = document.getElementById('processor').value;
-                    const cost = COSTS[processor] || 0.10;
-
-                    document.getElementById('countyCount').textContent = countyCount;
-                    document.getElementById('estimatedCost').textContent = '$' + (countyCount * cost).toFixed(2);
-                    document.getElementById('costEstimate').style.display = 'block';
+                    countyCount = Math.max(0, lines.length - 1);
 
                     // Parse first data row for preview
                     if (lines.length >= 2) {
@@ -1840,23 +1934,17 @@ For each business found, provide: name, full address, phone number, website URL,
                         if (countyIdx >= 0) firstCounty.county = firstRow[countyIdx]?.trim() || 'Alachua';
                         if (stateIdx >= 0) firstCounty.state = firstRow[stateIdx]?.trim() || 'FL';
                         if (countryIdx >= 0) firstCounty.country = firstRow[countryIdx]?.trim() || 'USA';
-
-                        updatePromptPreview();
                     }
+                    
+                    updateCostEstimate();
                 };
                 reader.readAsText(file);
             }
         });
 
-        document.getElementById('processor').addEventListener('change', function() {
-            const countyCount = parseInt(document.getElementById('countyCount').textContent) || 0;
-            const cost = COSTS[this.value] || 0.10;
-            document.getElementById('estimatedCost').textContent = '$' + (countyCount * cost).toFixed(2);
-        });
-
         async function startFindAll() {
             const fileInput = document.getElementById('csvFile');
-            const businessType = document.getElementById('businessType').value.trim();
+            const keywords = document.getElementById('keywords').value.trim();
             const promptTemplate = document.getElementById('promptTemplate').value.trim();
             const processor = document.getElementById('processor').value;
             const maxConcurrent = document.getElementById('maxConcurrent').value;
@@ -1866,8 +1954,8 @@ For each business found, provide: name, full address, phone number, website URL,
                 alert('Please select a CSV file');
                 return;
             }
-            if (!businessType) {
-                alert('Please enter a business type to search for');
+            if (!keywords) {
+                alert('Please enter at least one keyword to search for');
                 return;
             }
             if (!promptTemplate) {
@@ -1881,7 +1969,7 @@ For each business found, provide: name, full address, phone number, website URL,
 
             const formData = new FormData();
             formData.append('file', fileInput.files[0]);
-            formData.append('business_type', businessType);
+            formData.append('keywords', keywords);
             formData.append('prompt_template', promptTemplate);
             formData.append('processor', processor);
             formData.append('max_concurrent', maxConcurrent);
@@ -2004,16 +2092,21 @@ For each business found, provide: name, full address, phone number, website URL,
 @app.post("/findall/upload")
 async def upload_counties_csv(
     file: UploadFile = File(...),
-    business_type: str = Form("assisted living facilities"),
+    keywords: str = Form("assisted living facilities"),
     prompt_template: str = Form("Find all {business_type} in {county} County, {state}, {country}. They must be located specifically in {county} County to be valid."),
     processor: str = Form("core"),
     max_concurrent: int = Form(5),
     api_key: str = Form(...)
 ):
-    """Upload counties CSV and start Find All job"""
+    """Upload counties CSV and start Find All job with multiple keywords"""
 
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="File must be a CSV")
+
+    # Parse keywords (one per line)
+    business_types = [k.strip() for k in keywords.split('\n') if k.strip()]
+    if not business_types:
+        raise HTTPException(status_code=400, detail="Please provide at least one keyword to search")
 
     # Generate job ID
     job_id = str(uuid.uuid4())
@@ -2052,13 +2145,14 @@ async def upload_counties_csv(
     if not counties:
         raise HTTPException(status_code=400, detail="No valid county rows found. Ensure CSV has 'county' and 'state' columns.")
 
-    # Initialize job
-    estimated_cost = len(counties) * COST_PER_RUN.get(processor, 0.10)
+    # Calculate total searches (counties × keywords)
+    total_searches = len(counties) * len(business_types)
+    estimated_cost = total_searches * COST_PER_RUN.get(processor, 0.10)
 
     job_data = {
         'job_id': job_id,
         'status': 'pending',
-        'total_rows': len(counties),
+        'total_rows': total_searches,  # Total = counties × keywords
         'processed_rows': 0,
         'emails_found': 0,  # Will be used for business count
         'estimated_cost': estimated_cost,
@@ -2069,7 +2163,9 @@ async def upload_counties_csv(
         'success_count': 0,
         'fail_count': 0,
         'processor': processor,
-        'job_type': 'findall'
+        'job_type': 'findall',
+        'num_counties': len(counties),
+        'num_keywords': len(business_types)
     }
 
     JOBS[job_id] = job_data
@@ -2077,15 +2173,21 @@ async def upload_counties_csv(
     # Initialize log queue
     LOG_QUEUES[job_id] = Queue()
 
-    # Start background job
+    # Start background job with list of keywords
     thread = threading.Thread(
         target=run_findall_county_job,
-        args=(job_id, counties, business_type, prompt_template, processor, api_key, max_concurrent)
+        args=(job_id, counties, business_types, prompt_template, processor, api_key, max_concurrent)
     )
     thread.daemon = True
     thread.start()
 
-    return {"job_id": job_id, "total_counties": len(counties), "estimated_cost": estimated_cost}
+    return {
+        "job_id": job_id,
+        "total_counties": len(counties),
+        "total_keywords": len(business_types),
+        "total_searches": total_searches,
+        "estimated_cost": estimated_cost
+    }
 
 
 @app.get("/findall/results/{job_id}.json")
